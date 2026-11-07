@@ -1,0 +1,22 @@
+name: ChanCam
+options:
+  bundleIdPrefix: com.chan
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  ChanCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - Sources
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.chan.cam
+      INFOPLIST_FILE: Sources/Info.plist
+      GENERATE_INFOPLIST_FILE: NO
+      SWIFT_VERSION: "5.9"
+      TARGETED_DEVICE_FAMILY: "1"
+      CODE_SIGNING_ALLOWED: NO
+      CODE_SIGNING_REQUIRED: NO
+      MTL_ENABLE_DEBUG_INFO: NO
+      MTL_FAST_MATH: YES

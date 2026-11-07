@@ -1,0 +1,166 @@
+name: Build ChanCam IPA
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: ChanCam
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Read Version From Info.plist
+        id: ver
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Sources/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build App Archive
+        run: |
+          set -o pipefail
+          xcodebuild -project "$APP_NAME.xcodeproj" \
+            -scheme "$APP_NAME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "build/$APP_NAME.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO 2>&1 | tee build.log | grep -E "error:|BUILD|ARCHIVE" || true
+          test -d "build/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app"
+
+      - name: Show Compile Errors
+        if: failure()
+        run: grep -n "error:" build.log | head -60 || true
+
+      - name: Package Unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="Payload/$APP_NAME.app"
+          mkdir -p Payload
+          cp -R "build/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app" Payload/
+          cp Sources/AppIcon*.png "$APP/"
+          test -f "$APP/AppIcon60x60@3x.png"
+          test -f "$APP/default.metallib" && echo "metallib OK"
+          zip -qr "$APP_NAME.ipa" Payload
+          ls -l "$APP_NAME.ipa"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            git push origin ":refs/tags/$TAG"
+          fi
+          gh release create "$TAG" "$APP_NAME.ipa" \
+            --target "$GITHUB_SHA" \
+            --title "$APP_NAME $TAG" \
+            --notes "48MP ProRAW + LiDAR 보케 카메라 $TAG"
+
+      - name: Summary For Repo JSON
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          SIZE=$(stat -f%z "$APP_NAME.ipa")
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/$APP_NAME.ipa"
+          {
+            echo "### Feather 레포(JSON)에 넣을 값"
+            echo "- version: \`$VERSION\`"
+            echo "- size: \`$SIZE\`"
+            echo "- downloadURL: \`$URL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$VERSION size=$SIZE url=$URL"
+
+  screenshots:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build For Simulator
+        run: |
+          set -o pipefail
+          xcodebuild -project "$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/sim CODE_SIGNING_ALLOWED=NO build 2>&1 | tee sim.log | grep -E "error:|BUILD" || true
+          APP=$(find build/sim/Build/Products -name "$APP_NAME.app" -maxdepth 3 | head -1)
+          test -n "$APP"
+          codesign --force --deep -s - "$APP"
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Boot Simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = [d for rt, ds in json.load(sys.stdin)["devices"].items() if "iOS" in rt for d in ds]
+          pick = None
+          for want in ["iPhone 15 Pro", "iPhone 16 Pro", "iPhone 17 Pro"]:
+              pick = pick or next((d for d in devs if d["name"] == want), None)
+          pick = pick or next((d for d in devs if "Pro" in d["name"] and "Max" not in d["name"]), None) or devs[0]
+          print(pick["udid"])')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          for i in $(seq 1 60); do
+            xcrun simctl list devices | grep "$UDID" | grep -q "(Booted)" && break
+            sleep 5
+          done
+          sleep 25
+          xcrun simctl status_bar "$UDID" override --time "9:41" --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3
+          xcrun simctl install "$UDID" "$APP_PATH"
+
+      - name: Take Screenshots
+        run: |
+          mkdir -p shots
+          shoot() {
+            name=$1; shift
+            xcrun simctl terminate "$UDID" com.chan.cam >/dev/null 2>&1 || true
+            xcrun simctl launch "$UDID" com.chan.cam -demo "$@"
+            sleep 6
+            xcrun simctl io "$UDID" screenshot "shots/$name.png"
+          }
+          xcrun simctl ui "$UDID" appearance dark
+          shoot 1-camera
+          shoot 2-library -demoLibrary
+          shoot 3-editor -demoEditor
+          ls -l shots
+
+      - name: Upload Screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: shots/
+          retention-days: 14
