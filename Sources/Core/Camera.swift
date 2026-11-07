@@ -285,7 +285,7 @@ extension Camera: AVCapturePhotoCaptureDelegate {
     }
 
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
-                                 didFinishCaptureFor resolvedSettings: AVCaptureResolvedSettings,
+                                 didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                                  error: Error?) {
         let id = resolvedSettings.uniqueID
         Task { @MainActor in

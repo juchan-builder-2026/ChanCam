@@ -126,20 +126,31 @@ final class Renderer {
         encoder.dispatchThreadgroups(count, threadsPerThreadgroup: group)
     }
 
-    private func run(_ name: String, _ command: MTLCommandBuffer,
-                     textures: [MTLTexture?], bytes: [(UnsafeRawPointer, Int)] = [],
-                     size: (Int, Int)) throws {
+    private func encoder(_ name: String, _ command: MTLCommandBuffer,
+                         _ textures: [MTLTexture?]) throws -> (MTLComputeCommandEncoder, MTLComputePipelineState) {
         guard let encoder = command.makeComputeCommandEncoder() else { throw RenderError.encoder }
         let state = try pipeline(name)
         encoder.setComputePipelineState(state)
         for (index, texture) in textures.enumerated() {
             encoder.setTexture(texture, index: index)
         }
-        for (index, item) in bytes.enumerated() {
-            encoder.setBytes(item.0, length: item.1, index: index)
-        }
-        dispatch(encoder, state, size.0, size.1)
-        encoder.endEncoding()
+        return (encoder, state)
+    }
+
+    private func run(_ name: String, _ command: MTLCommandBuffer,
+                     textures: [MTLTexture?], size: (Int, Int)) throws {
+        let (enc, state) = try encoder(name, command, textures)
+        dispatch(enc, state, size.0, size.1)
+        enc.endEncoding()
+    }
+
+    private func run<P>(_ name: String, _ command: MTLCommandBuffer,
+                        textures: [MTLTexture?], params: P, size: (Int, Int)) throws {
+        let (enc, state) = try encoder(name, command, textures)
+        var value = params
+        enc.setBytes(&value, length: MemoryLayout<P>.stride, index: 0)
+        dispatch(enc, state, size.0, size.1)
+        enc.endEncoding()
     }
 
     // MARK: - 입력 준비
@@ -214,7 +225,7 @@ final class Renderer {
             throw RenderError.allocation
         }
 
-        var detailParams = DetailParams(
+        let detailParams = DetailParams(
             sharpness: settings.sharpness / 100,
             radius: settings.sharpenRadius,
             texture: settings.texture / 100,
@@ -224,7 +235,7 @@ final class Renderer {
 
         // 1) 노이즈 제거 (선형) — 원본은 건드리지 않는다
         try run("denoise", command, textures: [input.linear, front],
-                bytes: [(&detailParams, MemoryLayout<DetailParams>.stride)], size: (width, height))
+                params: detailParams, size: (width, height))
 
         // 2) 보케 — 선형 HDR, 1/4 해상도에서 계산 후 풀해상도로 합성
         if settings.bokehEnabled, let depth = input.depth {
@@ -240,18 +251,18 @@ final class Renderer {
         let maskW = max(width / maskRatio, 32), maskH = max(height / maskRatio, 32)
         guard let maskA = texture(maskW, maskH, format: .r16Float),
               let maskB = texture(maskW, maskH, format: .r16Float) else { throw RenderError.allocation }
-        var ratio = Float(maskRatio)
+        let ratio = Float(maskRatio)
         try run("luma_downsample", command, textures: [front, maskA],
-                bytes: [(&ratio, MemoryLayout<Float>.stride)], size: (maskW, maskH))
-        var maskRadius = Float(max(3, min(maskW, maskH) / 12))
+                params: ratio, size: (maskW, maskH))
+        let maskRadius = Float(max(3, min(maskW, maskH) / 12))
         try run("luma_blur_h", command, textures: [maskA, maskB],
-                bytes: [(&maskRadius, MemoryLayout<Float>.stride)], size: (maskW, maskH))
+                params: maskRadius, size: (maskW, maskH))
         try run("luma_blur_v", command, textures: [maskB, maskA],
-                bytes: [(&maskRadius, MemoryLayout<Float>.stride)], size: (maskW, maskH))
+                params: maskRadius, size: (maskW, maskH))
 
         // 4) 톤 + 컬러 → 디스플레이 공간
         let wb = Renderer.whiteBalanceGain(settings.temperature, settings.tint, input.asShotNeutral)
-        var toneParams = ToneParams(
+        let toneParams = ToneParams(
             exposure: settings.exposure,
             contrast: settings.contrast / 100,
             highlights: settings.highlights / 100,
@@ -262,32 +273,32 @@ final class Renderer {
             saturation: settings.saturation / 100,
             tempScaleR: wb.x, tempScaleG: wb.y, tempScaleB: wb.z)
         try run("tone_color", command, textures: [front, maskA, back],
-                bytes: [(&toneParams, MemoryLayout<ToneParams>.stride)], size: (width, height))
+                params: toneParams, size: (width, height))
         swap(&front, &back)
 
         // 5) 디테일 (클래리티용 대반경 휘도 블러도 1/8 에서)
         guard let clarityA = texture(maskW, maskH, format: .r16Float),
               let clarityB = texture(maskW, maskH, format: .r16Float) else { throw RenderError.allocation }
         try run("luma_downsample", command, textures: [front, clarityA],
-                bytes: [(&ratio, MemoryLayout<Float>.stride)], size: (maskW, maskH))
-        var clarityRadius = Float(max(4, min(maskW, maskH) / 8))
+                params: ratio, size: (maskW, maskH))
+        let clarityRadius = Float(max(4, min(maskW, maskH) / 8))
         try run("luma_blur_h", command, textures: [clarityA, clarityB],
-                bytes: [(&clarityRadius, MemoryLayout<Float>.stride)], size: (maskW, maskH))
+                params: clarityRadius, size: (maskW, maskH))
         try run("luma_blur_v", command, textures: [clarityB, clarityA],
-                bytes: [(&clarityRadius, MemoryLayout<Float>.stride)], size: (maskW, maskH))
+                params: clarityRadius, size: (maskW, maskH))
         try run("detail", command, textures: [front, clarityA, back],
-                bytes: [(&detailParams, MemoryLayout<DetailParams>.stride)], size: (width, height))
+                params: detailParams, size: (width, height))
         swap(&front, &back)
 
         // 6) 마무리
-        var finishParams = FinishParams(
+        let finishParams = FinishParams(
             vignette: settings.vignette / 100,
             grain: settings.grain / 100,
             grainSize: settings.grainSize,
             chroma: settings.chromaticAberration / 100,
             seed: 7)
         try run("finish", command, textures: [front, back],
-                bytes: [(&finishParams, MemoryLayout<FinishParams>.stride)], size: (width, height))
+                params: finishParams, size: (width, height))
 
         command.commit()
         command.waitUntilCompleted()
@@ -317,26 +328,26 @@ final class Renderer {
               let cocSmooth = texture(smallW, smallH, format: .r16Float) else {
             throw RenderError.allocation
         }
-        var ratio = Float(scale)
+        let ratio = Float(scale)
         try run("downsample_box", command, textures: [source, smallSrc],
-                bytes: [(&ratio, MemoryLayout<Float>.stride)], size: (smallW, smallH))
+                params: ratio, size: (smallW, smallH))
 
         // 깊이를 색상 가이드로 업샘플 (LiDAR 해상도 → 1/4 해상도)
         var sigmaColor: Float = 0.12
         try run("depth_upsample", command, textures: [smallSrc, depth, depthHi],
-                bytes: [(&sigmaColor, MemoryLayout<Float>.stride)], size: (smallW, smallH))
+                params: sigmaColor, size: (smallW, smallH))
 
         var depthFinal = depthHi
         if let matte {
             guard let refined = texture(smallW, smallH, format: .r32Float) else { throw RenderError.allocation }
-            var subject = focus
+            let subject = focus
             try run("depth_refine_matte", command, textures: [depthHi, matte, refined],
-                    bytes: [(&subject, MemoryLayout<Float>.stride)], size: (smallW, smallH))
+                    params: subject, size: (smallW, smallH))
             depthFinal = refined
         }
 
         // 착란원 — 1/4 해상도 픽셀 단위로 바로 계산
-        var cocParams = CoCParams(
+        let cocParams = CoCParams(
             focusDistance: focus,
             focalLength: settings.focalLength,
             fNumber: settings.fNumber,
@@ -344,14 +355,14 @@ final class Renderer {
             imageWidth: Float(smallW),
             maxCoC: 110)
         try run("coc_from_depth", command, textures: [depthFinal, cocRaw],
-                bytes: [(&cocParams, MemoryLayout<CoCParams>.stride)], size: (smallW, smallH))
+                params: cocParams, size: (smallW, smallH))
         try run("coc_smooth", command, textures: [cocRaw, cocSmooth], size: (smallW, smallH))
 
         let maxRadius = min(Renderer.maxCoCPixels(settings: settings, focus: focus,
                                                   imageWidth: Float(smallW)), 110)
         guard maxRadius >= 1 else { return false }
 
-        var bokehParams = BokehParams(
+        let bokehParams = BokehParams(
             maxRadius: maxRadius,
             rings: Float(maxRadius > 40 ? 12 : (maxRadius > 16 ? 9 : 6)),
             blades: Float(settings.apertureBlades),
@@ -361,16 +372,16 @@ final class Renderer {
             ring: settings.bokehRing,
             rotation: 0.21)
         try run("bokeh_gather", command, textures: [smallSrc, cocSmooth, smallOut],
-                bytes: [(&bokehParams, MemoryLayout<BokehParams>.stride)], size: (smallW, smallH))
+                params: bokehParams, size: (smallW, smallH))
 
         // 풀해상도 합성 — CoC 는 1/4 텍스처를 정규화 좌표로 샘플링하므로 그대로 쓴다.
         // 다만 블러/선명 판정은 풀해상도 픽셀 기준이어야 하니 스케일을 맞춘 사본을 쓴다.
         guard let cocForComposite = texture(smallW, smallH, format: .r16Float) else {
             throw RenderError.allocation
         }
-        var upScale = Float(scale)
+        let upScale = Float(scale)
         try run("downsample_coc", command, textures: [cocSmooth, cocForComposite],
-                bytes: [(&upScale, MemoryLayout<Float>.stride)], size: (smallW, smallH))
+                params: upScale, size: (smallW, smallH))
         try run("bokeh_composite", command, textures: [source, smallOut, cocForComposite, destination],
                 size: (width, height))
         return true

@@ -266,7 +266,7 @@ final class ShotStore: ObservableObject {
 
     // MARK: - 도우미
 
-    static func depthMap(from buffer: CVPixelBuffer) -> DepthMap? {
+    nonisolated static func depthMap(from buffer: CVPixelBuffer) -> DepthMap? {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let width = CVPixelBufferGetWidth(buffer)
@@ -287,7 +287,7 @@ final class ShotStore: ObservableObject {
         return DepthMap(width: width, height: height, values: values)
     }
 
-    static func downscale(_ image: UIImage, maxSide: CGFloat) -> UIImage {
+    nonisolated static func downscale(_ image: UIImage, maxSide: CGFloat) -> UIImage {
         let size = image.size
         let longest = max(size.width, size.height)
         guard longest > maxSide else { return image }

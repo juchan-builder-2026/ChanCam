@@ -4,6 +4,7 @@ import UIKit
 
 /// 시뮬레이터 스크린샷 전용 가짜 데이터. `-demo` 인수로만 동작하고
 /// 카메라나 네트워크를 전혀 쓰지 않는다.
+@MainActor
 enum DemoData {
     static func install() {
         let store = ShotStore.shared
@@ -52,7 +53,7 @@ enum DemoData {
     }
 
     /// 보케 느낌이 나는 가짜 샘플 이미지
-    static func sample(hue: Double, seed: Int) -> UIImage {
+    nonisolated static func sample(hue: Double, seed: Int) -> UIImage {
         let size = CGSize(width: 900, height: 1200)
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1

@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 
 /// 목록 썸네일 캐시
+@MainActor
 final class ThumbCache {
     static let shared = ThumbCache()
     private let cache = NSCache<NSString, UIImage>()
