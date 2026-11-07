@@ -45,7 +45,7 @@ struct Shot: Codable, Identifiable, Equatable {
 
     var summaryLine: String {
         var parts: [String] = []
-        if pixelWidth > 0 { parts.append(String(format: "%.0fMP", megapixels)) }
+        if pixelWidth > 0 { parts.append(String(format: "%.0fMP", megapixels.rounded(.down))) }
         if isProRAW { parts.append("ProRAW") }
         if hasDepth { parts.append("LiDAR") }
         if iso > 0 { parts.append("ISO \(Int(iso))") }

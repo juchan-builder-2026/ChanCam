@@ -92,6 +92,8 @@ struct LibraryView: View {
             }
             .navigationTitle("보관함")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(Material.bar, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("닫기") { dismiss() }
@@ -122,6 +124,13 @@ private struct GridCell: View {
     let state: JobState?
 
     var body: some View {
+        Color.clear
+            .aspectRatio(1, contentMode: .fit)
+            .overlay { content }
+            .clipShape(Rectangle())
+    }
+
+    private var content: some View {
         ZStack(alignment: .bottomLeading) {
             Rectangle().fill(Color(.secondarySystemBackground))
             if let image = ThumbCache.shared.image(for: shot) {
@@ -154,8 +163,6 @@ private struct GridCell: View {
             .padding(4)
             .shadow(radius: 2)
         }
-        .aspectRatio(1, contentMode: .fill)
-        .clipped()
     }
 }
 
