@@ -87,8 +87,28 @@ struct CoCParams {
     float sensorWidth;    // mm (풀프레임 36)
     float imageWidth;     // px
     float maxCoC;         // px 상한
+    float scale;          // 보케 배율 (물리값 위에 얹는 과장)
+    float _pad1;
+};
+
+/// 깊이 업샘플 — 저해상 LiDAR 깊이를 이미지 좌표로 옮길 때의 보정
+struct UpsampleParams {
+    float sigmaColor;
+    float scaleX;         // 이미지 uv → 깊이 uv (확대/크롭 + 화각 차이 보정)
+    float scaleY;
+    float offsetX;
+    float offsetY;
+    float rotation;       // 0,1,2,3 = 0°,90°,180°,270°
+    float mirror;         // 0 또는 1
+    float _pad0;
+};
+
+/// 흐린 층을 선명한 원본 위에 올릴 때
+struct CompositeParams {
+    float upscale;        // 출력/작업 해상도 비. 1 이면 보정 안 함
     float _pad0;
     float _pad1;
+    float _pad2;
 };
 
 struct FinishParams {

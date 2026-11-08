@@ -57,6 +57,26 @@ struct SensorProbe {
         return Group(title: "기기", symbol: "iphone", rows: rows)
     }
 
+    // MARK: - 좌표계 방향 (실측)
+
+    static func orientationGroup() -> Group {
+        guard let renderer = Renderer.shared else {
+            return Group(title: "좌표계 방향", symbol: "arrow.up.and.down.righttriangle.up.righttriangle.down",
+                         rows: [Row(title: "Metal", value: "사용 불가", good: false)])
+        }
+        let report = renderer.orientationReport
+        let rows: [Row] = [
+            Row(title: "렌더한 텍스처", value: report.texture),
+            Row(title: "깊이맵 업로드",
+                value: renderer.textureOriginIsBottom ? "같이 뒤집어 올림" : "그대로 올림", good: true),
+            Row(title: "출력 경로", value: report.output),
+            Row(title: "최종 적용", value: renderer.outputNeedsFlip ? "세로 되돌림" : "손대지 않음"),
+        ]
+        return Group(title: "좌표계 방향", symbol: "arrow.up.and.down.righttriangle.up.righttriangle.down",
+                     rows: rows,
+                     note: "CoreImage 는 좌하단 원점, Metal 텍스처는 좌상단 원점이에요. 이 변환을 코드로 가정하면 OS 버전·경로에 따라 틀려서, 앱이 시작할 때 알려진 그림을 한 번 통과시켜 직접 재요. 사진이 거꾸로 나오고 보케가 엉뚱한 데 걸렸던 게 전부 이 한 가지 때문이었어요 — 색 이미지만 뒤집히고 깊이맵은 안 뒤집혀서, 발밑 바닥이 '먼 깊이'를 읽어 선명하게 남았거든요.")
+    }
+
     // MARK: - GPU
 
     static func gpuGroup() -> Group {

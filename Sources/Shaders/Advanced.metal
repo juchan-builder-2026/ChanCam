@@ -34,6 +34,79 @@ kernel void zero_fill(texture2d<float, access::write> dst [[texture(0)]],
 }
 
 // ---------------------------------------------------------------------------
+//  0.5 깊이 구멍 메우기 (push-pull)
+//
+//  LiDAR 는 5m 쯤 넘어가면 아무것도 못 읽는다. 하늘, 먼 나무, 유리, 젖은 아스팔트
+//  전부 0 으로 온다. 거리 화면이라면 화면의 절반 이상이 구멍이다.
+//  유효한 값만 가중 평균하며 피라미드를 올리고(pull), 내려오면서 구멍만
+//  부모 값으로 메운다(push). 영상 기반 렌더링의 표준 기법이고, 가장자리를
+//  뭉개지 않으면서 빈 곳을 '주변이 말하는 거리'로 채운다.
+// ---------------------------------------------------------------------------
+
+/// r32f 깊이 → rg16f (깊이×가중치, 가중치)
+kernel void depth_pack(texture2d<float, access::read>  src [[texture(0)]],
+                       texture2d<float, access::write> dst [[texture(1)]],
+                       uint2 gid                           [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float d = src.read(gid).r;
+    bool ok = d > 0.02f && d < 300.0f;
+    dst.write(float4(ok ? d : 0.0f, ok ? 1.0f : 0.0f, 0, 1), gid);
+}
+
+/// 2x2 를 모아 올린다 (유효한 것만)
+kernel void depth_pull(texture2d<float, access::read>  src [[texture(0)]],
+                       texture2d<float, access::write> dst [[texture(1)]],
+                       uint2 gid                           [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    uint sw = src.get_width(), sh = src.get_height();
+    float2 acc = 0.0f;
+    for (uint dy = 0; dy < 2; ++dy) {
+        for (uint dx = 0; dx < 2; ++dx) {
+            uint2 p = uint2(min(gid.x * 2 + dx, sw - 1), min(gid.y * 2 + dy, sh - 1));
+            acc += src.read(p).rg;
+        }
+    }
+    dst.write(float4(acc.x, acc.y, 0, 1), gid);
+}
+
+/// 내려오면서 구멍만 부모 값으로 메운다
+kernel void depth_push(texture2d<float, access::read>   fine   [[texture(0)]],
+                       texture2d<float, access::sample> coarse [[texture(1)]],
+                       texture2d<float, access::write>  dst    [[texture(2)]],
+                       uint2 gid                                [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 here = fine.read(gid).rg;
+    if (here.y > 0.001f) { dst.write(float4(here.x, here.y, 0, 1), gid); return; }
+    float2 uv = (float2(gid) + 0.5f) / float2(w, h);
+    float2 up = coarse.sample(kLinear, uv).rg;
+    if (up.y > 0.001f) {
+        // 부모의 평균 깊이를 가중치 1 로 내려받는다
+        dst.write(float4(up.x / up.y, 1.0f, 0, 1), gid);
+    } else {
+        dst.write(float4(0, 0, 0, 1), gid);
+    }
+}
+
+/// rg16f → r32f 깊이. 끝까지 못 메운 곳은 '아주 먼 곳'으로 둔다.
+kernel void depth_unpack(texture2d<float, access::read>  src [[texture(0)]],
+                         texture2d<float, access::write> dst [[texture(1)]],
+                         constant float& farDistance          [[buffer(0)]],
+                         uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 v = src.read(gid).rg;
+    float d = (v.y > 0.001f) ? (v.x / v.y) : farDistance;
+    dst.write(float4(max(d, 0.02f), 0, 0, 1), gid);
+}
+
+// ---------------------------------------------------------------------------
 //  1. 복사량 분리 (split radiance estimator)
 //
 //  밝은 점 하나를 레이 마칭으로 적분하면 샘플이 운 좋게 그 픽셀을 맞출 때만

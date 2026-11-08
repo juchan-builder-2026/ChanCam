@@ -14,10 +14,13 @@
 //     이게 없으면 보케 경계가 LiDAR 해상도(저해상)로 뭉개진다.
 // ---------------------------------------------------------------------------
 
+//  유효한 이웃을 하나도 못 찾으면 0(구멍)을 적는다. 예전처럼 0 을 그대로
+//  "거리 0 = 초점 맞음"으로 흘려보내면 LiDAR 사거리 밖(하늘·먼 나무)이 통째로
+//  선명하게 남아 보케가 엉망이 된다. 구멍은 뒤의 push-pull 단계가 메운다.
 kernel void depth_upsample(texture2d<float, access::sample> guide   [[texture(0)]],  // 선형 RGB
                            texture2d<float, access::sample> depthLo [[texture(1)]],  // R = 미터, 0 = 무효
                            texture2d<float, access::write>  depthHi [[texture(2)]],
-                           constant float& sigmaColor               [[buffer(0)]],
+                           constant UpsampleParams& P               [[buffer(0)]],
                            uint2 gid                                [[thread_position_in_grid]])
 {
     uint w = depthHi.get_width(), h = depthHi.get_height();
@@ -26,25 +29,36 @@ kernel void depth_upsample(texture2d<float, access::sample> guide   [[texture(0)
     float2 uv = (float2(gid) + 0.5f) / float2(w, h);
     float centerL = luma(guide.sample(kLinear, uv).rgb);
 
+    // 이미지 uv → 깊이 uv (방향 보정 → 확대/크롭 보정)
+    float2 t = uv - 0.5f;
+    int rot = int(P.rotation);
+    if (rot == 1) t = float2(-t.y, t.x);
+    else if (rot == 2) t = -t;
+    else if (rot == 3) t = float2(t.y, -t.x);
+    if (P.mirror > 0.5f) t.x = -t.x;
+    t += 0.5f;
+    float2 duv = float2(P.offsetX, P.offsetY) + t * float2(P.scaleX, P.scaleY);
+
     float2 loSize = float2(depthLo.get_width(), depthLo.get_height());
     float2 step = 1.0f / loSize;
 
     float acc = 0.0f, wsum = 0.0f;
-    // 저해상 깊이에서 5x5 이웃을 색상 유사도로 가중 평균
-    for (int dy = -2; dy <= 2; ++dy) {
-        for (int dx = -2; dx <= 2; ++dx) {
-            float2 suv = uv + float2(dx, dy) * step;
+    // 저해상 깊이에서 7x7 이웃을 색상 유사도로 가중 평균
+    for (int dy = -3; dy <= 3; ++dy) {
+        for (int dx = -3; dx <= 3; ++dx) {
+            float2 suv = duv + float2(dx, dy) * step;
             float d = depthLo.sample(kNearest, suv).r;
-            if (d <= 0.0f) continue;
-            float sl = luma(guide.sample(kLinear, suv).rgb);
-            float dc = (sl - centerL) / max(sigmaColor, 1e-3f);
-            float ds = float(dx * dx + dy * dy) / 8.0f;
+            if (d <= 0.02f) continue;
+            float sl = luma(guide.sample(kLinear, uv + float2(dx, dy) * step).rgb);
+            float dc = (sl - centerL) / max(P.sigmaColor, 1e-3f);
+            float ds = float(dx * dx + dy * dy) / 14.0f;
             float wgt = exp(-0.5f * (dc * dc + ds));
             acc += d * wgt;
             wsum += wgt;
         }
     }
-    float result = (wsum > 1e-5f) ? (acc / wsum) : depthLo.sample(kLinear, uv).r;
+    // 못 찾았으면 구멍(0). 절대 '초점 맞음'으로 둔갑시키지 않는다.
+    float result = (wsum > 1e-5f) ? (acc / wsum) : 0.0f;
     depthHi.write(float4(result, 0, 0, 1), gid);
 }
 
@@ -80,13 +94,17 @@ kernel void coc_from_depth(texture2d<float, access::read>  depth [[texture(0)]],
     if (gid.x >= w || gid.y >= h) return;
 
     float d = depth.read(gid).r;                 // m
-    if (d <= 0.02f || P.focusDistance <= 0.02f) { coc.write(float4(0), gid); return; }
+    if (P.focusDistance <= 0.02f) { coc.write(float4(0), gid); return; }
+    // 깊이를 못 읽은 곳은 '초점 맞음'이 아니라 '아주 먼 곳'이다.
+    // LiDAR 는 5m 쯤부터 아무것도 못 읽는데, 그걸 0 으로 두면 하늘과 먼 배경이
+    // 통째로 선명하게 남는다 (v1.2 에서 보케가 이상했던 진짜 이유).
+    if (d <= 0.02f) d = 400.0f;
 
     float f  = P.focalLength;                    // mm
     float S1 = P.focusDistance * 1000.0f;        // mm
     float S2 = d * 1000.0f;                      // mm
     float cocMM = (f * f / max(P.fNumber, 0.7f)) * abs(S2 - S1) / (S2 * max(S1 - f, 1.0f));
-    float px = cocMM / P.sensorWidth * P.imageWidth;
+    float px = cocMM / P.sensorWidth * P.imageWidth * max(P.scale, 0.0f);
     px = min(px, P.maxCoC);
     coc.write(float4((S2 >= S1) ? px : -px, 0, 0, 1), gid);
 }
@@ -518,21 +536,52 @@ kernel void bokeh_gather(texture2d<float, access::sample> src [[texture(0)]],  /
     dst.write(float4(result, 1), gid);
 }
 
-// 보케 결과(저해상)를 선명한 원본과 CoC 로 합성
+// 보케 결과를 선명한 원본과 CoC 로 합성.
+//
+// 흐린 층이 출력보다 작으면 그냥 확대해서 섞을 때 경계가 뭉갠 것처럼 번진다.
+// 그래서 선명한 원본을 가이드로 쓰는 조인트 바이래터럴 업샘플을 한다 —
+// 초점 경계 근처에서만 가이드를 믿고, 깊은 블러 안에서는 가이드를 무시한다
+// (거기엔 원본에 쓸 만한 정보가 없으니까).
 kernel void bokeh_composite(texture2d<float, access::sample> sharp  [[texture(0)]],
                             texture2d<float, access::sample> blurred[[texture(1)]],
                             texture2d<float, access::sample> coc    [[texture(2)]],
                             texture2d<float, access::write>  dst    [[texture(3)]],
+                            constant CompositeParams& P             [[buffer(0)]],
                             uint2 gid                               [[thread_position_in_grid]])
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
     float2 uv = (float2(gid) + 0.5f) / float2(w, h);
     float3 a = sharp.sample(kLinear, uv).rgb;
-    float3 b = blurred.sample(kLinear, uv).rgb;
     float c = abs(coc.sample(kLinear, uv).r);
     // CoC 1px 미만은 선명하게, 3px 이상은 완전히 블러
     float t = smoothstep(0.8f, 3.0f, c);
+    if (t <= 0.002f) { dst.write(float4(a, 1), gid); return; }
+
+    float3 b;
+    if (P.upscale <= 1.05f) {
+        b = blurred.sample(kLinear, uv).rgb;
+    } else {
+        float2 bStep = 1.0f / float2(blurred.get_width(), blurred.get_height());
+        float guideL = luma(a);
+        // 흐림이 깊어질수록 가이드를 덜 믿는다
+        float trust = 1.0f - smoothstep(2.5f, 10.0f, c);
+        float3 acc = 0.0f;
+        float wsum = 0.0f;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                float3 s = blurred.sample(kLinear, uv + float2(dx, dy) * bStep).rgb;
+                float wgt = (dx == 0 && dy == 0) ? 2.0f : ((dx == 0 || dy == 0) ? 1.0f : 0.6f);
+                if (trust > 0.01f) {
+                    float dl = (luma(s) - guideL) / 0.22f;
+                    wgt *= mix(1.0f, exp(-0.5f * dl * dl), trust);
+                }
+                acc += s * wgt;
+                wsum += wgt;
+            }
+        }
+        b = acc / max(wsum, 1e-5f);
+    }
     dst.write(float4(mix(a, b, t), 1), gid);
 }
 

@@ -163,6 +163,16 @@ struct EditorView: View {
         }
     }
 
+    /// 지금 실제로 쓰이는 환산 화각과 확대에 따른 해상도 손실
+    private var autoFocalNote: String {
+        let captured = shot.focalLength35 > 1 ? shot.focalLength35 : 24
+        let effective = settings.effectiveFocalLength(captured: captured)
+        let base = String(format: "촬영 %.0fmm → 지금 %.0fmm 상당", captured, effective)
+        guard settings.zoom > 1.01 else { return base }
+        let mp = shot.megapixels / Double(settings.zoom * settings.zoom)
+        return base + String(format: " · %.1fMP 로 잘림", mp)
+    }
+
     private func matches(_ other: DevelopSettings) -> Bool {
         var a = settings, b = other
         a.focusDistance = 0; b.focusDistance = 0
@@ -206,6 +216,36 @@ struct EditorView: View {
 
                     if settings.bokehEnabled && shot.hasDepth {
                         BokehInfoRow(settings: settings, shot: shot)
+
+                        Toggle(isOn: Binding(get: { settings.autoFocalLength },
+                                             set: { settings.autoFocalLength = $0; scheduleRender() })) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("화각 자동 인식").font(.subheadline.weight(.medium))
+                                Text(autoFocalNote).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("깊이 방향 — 보케가 엉뚱한 데 걸리면 돌려보세요")
+                                .font(.caption2).foregroundStyle(.white.opacity(0.5))
+                            Picker("", selection: Binding(
+                                get: { settings.depthRotation },
+                                set: { settings.depthRotation = $0; scheduleRender() })) {
+                                Text("0°").tag(0)
+                                Text("90°").tag(1)
+                                Text("180°").tag(2)
+                                Text("270°").tag(3)
+                            }
+                            .pickerStyle(.segmented)
+                            Toggle("깊이 좌우 반전", isOn: Binding(
+                                get: { settings.depthMirror },
+                                set: { settings.depthMirror = $0; scheduleRender() }))
+                                .font(.subheadline)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
                     }
                 }
 
@@ -350,13 +390,19 @@ struct BokehInfoRow: View {
         settings.focusDistance > 0.02 ? settings.focusDistance : shot.focusDistance
     }
 
+    private var effectiveFocal: Float {
+        settings.effectiveFocalLength(captured: shot.focalLength35 > 1 ? shot.focalLength35 : 24)
+    }
+
     private var maxBlur: Float {
         Renderer.maxCoCPixels(settings: settings, focus: max(focus, 0.3),
+                              focalLength: effectiveFocal,
                               imageWidth: Float(max(shot.pixelWidth, 4032)))
     }
 
     var body: some View {
         HStack(spacing: 14) {
+            info("화각", String(format: "%.0fmm", effectiveFocal))
             info("조리개", String(format: "f/%.1f", settings.fNumber))
             info("초점", focus > 0.02 ? String(format: "%.2fm", focus) : "자동")
             info("최대 흐림", String(format: "%.0fpx", maxBlur))

@@ -259,8 +259,19 @@ final class ShotStore: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: indexURL),
-              let saved = try? JSONDecoder().decode([Shot].self, from: data) else { return }
+        guard let data = try? Data(contentsOf: indexURL) else { return }
+        var saved: [Shot] = []
+        if let decoded = try? JSONDecoder().decode([Shot].self, from: data) {
+            saved = decoded
+        } else if let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+            // 한 장이 깨져도 보관함 전체가 날아가지 않게 한 장씩 다시 시도한다
+            for item in raw {
+                guard let itemData = try? JSONSerialization.data(withJSONObject: item),
+                      let shot = try? JSONDecoder().decode(Shot.self, from: itemData) else { continue }
+                saved.append(shot)
+            }
+        }
+        guard !saved.isEmpty else { return }
         // 폴더가 사라진 항목은 정리
         shots = saved.filter { FileManager.default.fileExists(atPath: folder($0).path) }
         if shots.count != saved.count { persist() }

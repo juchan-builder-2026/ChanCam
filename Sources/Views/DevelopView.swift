@@ -143,7 +143,8 @@ struct DevelopView: View {
                               range: 1.2...12, step: 0.2,
                               text: String(format: "%.1f", recipe.lightThreshold))
             }
-            LabeledContent("보케 작업 해상도", value: "\(recipe.bokehSide)px")
+            LabeledContent("보케 작업 해상도",
+                           value: "\(recipe.bokehSide)px (출력의 \(Int(recipe.tier.bokehFraction * 100))%)")
             LabeledContent("픽셀당 광선 탭", value: "\(recipe.tapsPerPixel)")
         } header: {
             Text("광학 시뮬레이션")
@@ -507,6 +508,23 @@ private struct ProgressStage: View {
                 Text("한 장 평균 \(DevelopView.duration(perShot))")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+            if !batch.stageTimes.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(batch.stageTimes.sorted { $0.seconds > $1.seconds }) { stage in
+                        HStack {
+                            Text(stage.name).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(DevelopView.duration(stage.seconds)).monospacedDigit()
+                        }
+                        .font(.caption)
+                        .padding(.vertical, 5)
+                        .padding(.horizontal, 12)
+                    }
+                }
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.primary.opacity(0.06)))
+                .padding(.top, 6)
             }
         }
         .padding(.top, 4)

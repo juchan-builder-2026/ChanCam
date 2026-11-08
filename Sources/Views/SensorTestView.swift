@@ -156,6 +156,7 @@ struct SensorTestView: View {
     private func reload() {
         var list: [SensorProbe.Group] = [
             SensorProbe.deviceGroup(),
+            SensorProbe.orientationGroup(),
             SensorProbe.gpuGroup(),
             SensorProbe.neuralGroup(),
             SensorProbe.photoGroup(camera.capabilities),

@@ -60,13 +60,27 @@ enum DevelopTier: Int, Codable, CaseIterable, Identifiable {
         }
     }
 
-    /// 보케 계산 해상도 (긴 변)
-    var bokehSide: Int {
+    /// 보케를 출력 해상도의 몇 배속에서 계산할지.
+    ///
+    /// v1.2 까지는 고정 해상도였는데, 24MP 결과에 1600px 보케를 확대해 얹으니
+    /// 흐린 부분이 '확대한 티'가 났다. 출력에 비례시키면 극한에서는 원본 해상도
+    /// 그대로 광선을 쏜다 — 그만큼 느려지는 게 정상이다.
+    var bokehFraction: Double {
         switch self {
-        case .draft: return 900
-        case .standard: return 1200
-        case .advanced: return 1600
-        case .extreme: return 2200
+        case .draft: return 0.18
+        case .standard: return 0.32
+        case .advanced: return 0.55
+        case .extreme: return 1.0
+        }
+    }
+
+    /// 보케 계산 해상도 상한 (메모리 보호)
+    var bokehCap: Int {
+        switch self {
+        case .draft: return 1000
+        case .standard: return 1700
+        case .advanced: return 3000
+        case .extreme: return 8200
         }
     }
 
@@ -171,7 +185,13 @@ struct DevelopRecipe: Codable, Equatable {
         }
     }
 
-    var bokehSide: Int { tier.bokehSide }
+    /// 이 출력 크기에서 쓸 보케 계산 해상도 (긴 변)
+    func bokehSide(outputLong: Int) -> Int {
+        let wanted = Int(Double(outputLong) * tier.bokehFraction)
+        return min(max(wanted, 640), min(tier.bokehCap, outputLong))
+    }
+
+    var bokehSide: Int { bokehSide(outputLong: longSide) }
 
     /// 광선 하나당 텍스처 탭 수 × 조리개 샘플 = 픽셀당 작업량
     var tapsPerPixel: Int {
@@ -181,7 +201,8 @@ struct DevelopRecipe: Codable, Equatable {
 
     /// 아주 거친 예상 시간(초). 기기별로 많이 다르다 — 어디까지나 눈금이다.
     func estimatedSeconds(gpuScore: Double) -> Double {
-        let bokehPixels = Double(bokehSide * bokehSide) * 0.75
+        let side = bokehSide
+        let bokehPixels = Double(side * side) * 0.75
         let outPixels = Double(longSide * longSide) * 0.75
         // 보케(레이트레이싱) + 신경망 + 나머지 풀해상도 패스
         var work = bokehPixels * Double(tapsPerPixel)
@@ -194,8 +215,9 @@ struct DevelopRecipe: Codable, Equatable {
 
     /// 중간 버퍼가 차지하는 대략적인 최대 메모리 (바이트)
     var estimatedBytes: Int64 {
+        let side = bokehSide
         let out = Int64(Double(longSide * longSide) * 0.75)
-        let bok = Int64(Double(bokehSide * bokehSide) * 0.75)
+        let bok = Int64(Double(side * side) * 0.75)
         // 풀해상도 RGBA16F 2장 + 1/2, 1/4 보조 + 보케 작업 버퍼 5장 + 산란 빈
         var total = out * 8 * 2
         total += out * 8 / 4 + out * 8 / 16

@@ -73,8 +73,26 @@ struct CoCParams {
     var sensorWidth: Float = 36
     var imageWidth: Float = 4032
     var maxCoC: Float = 120
+    var scale: Float = 1
+    var pad1: Float = 0
+}
+
+struct UpsampleParams {
+    var sigmaColor: Float = 0.12
+    var scaleX: Float = 1
+    var scaleY: Float = 1
+    var offsetX: Float = 0
+    var offsetY: Float = 0
+    var rotation: Float = 0
+    var mirror: Float = 0
+    var pad0: Float = 0
+}
+
+struct CompositeParams {
+    var upscale: Float = 1
     var pad0: Float = 0
     var pad1: Float = 0
+    var pad2: Float = 0
 }
 
 struct FinishParams {
@@ -199,6 +217,9 @@ final class Renderer: @unchecked Sendable {
 
     /// 미리보기용 보케 계산 해상도 (긴 변)
     static let bokehLongSide = 1200
+    /// 깊이·착란원 계산 해상도 상한. 깊이는 저주파라 여기서 끝내도 손해가 없고,
+    /// 구멍 메우기 피라미드 메모리가 폭발하지 않는다.
+    static let depthWorkingSide = 1400
     /// 레이트레이싱 한 번에 몰아 쏘는 조리개 샘플 수.
     /// 이 단위로 명령 버퍼를 끊어서 진행률이 실제로 움직인다.
     static let marchChunk = 8
@@ -303,12 +324,141 @@ final class Renderer: @unchecked Sendable {
         return command
     }
 
+    // MARK: - 방향 (추측하지 않고 실제로 재 본다)
+
+    /// CoreImage 는 좌하단 원점, Metal 텍스처는 좌상단 원점이다.
+    /// 두 세계를 오갈 때 세로가 뒤집히는데, 그 규칙이 OS 버전과 경로에 따라
+    /// 달라서 코드로 가정하면 반드시 틀린다. (v1.0~v1.2 에서 사진이 거꾸로
+    /// 나오고 깊이맵이 어긋나 보케가 엉뚱한 데 걸린 이유가 정확히 이거다.)
+    ///
+    /// 그래서 가정하지 않고, 앱이 시작될 때 알려진 그림을 한 번 통과시켜
+    /// 어디로 나오는지 직접 읽는다. 두 가지를 따로 잰다:
+    ///   · textureOriginIsBottom — 렌더한 텍스처의 0번 행이 이미지의 아래인가?
+    ///     (그렇다면 깊이맵도 같은 방향으로 뒤집어 올려야 한다)
+    ///   · outputNeedsFlip      — 최종 출력 경로에서 세로를 되돌려야 하는가?
+    private struct Orientation {
+        var textureOriginIsBottom = false
+        var outputNeedsFlip = false
+    }
+
+    private var orientationCache: Orientation?
+    private let orientationLock = NSLock()
+
+    /// 0 = 자동(실측), 1 = 강제로 뒤집기, 2 = 강제로 안 뒤집기
+    var outputFlipOverride = 0
+
+    private var orientation: Orientation {
+        orientationLock.lock()
+        defer { orientationLock.unlock() }
+        if let cached = orientationCache { return cached }
+        let measured = measureOrientation()
+        orientationCache = measured
+        return measured
+    }
+
+    var textureOriginIsBottom: Bool { orientation.textureOriginIsBottom }
+
+    var outputNeedsFlip: Bool {
+        switch outputFlipOverride {
+        case 1: return true
+        case 2: return false
+        default: return orientation.outputNeedsFlip
+        }
+    }
+
+    /// 방향 진단 결과를 사람이 읽을 수 있게 (센서 테스터에 표시)
+    var orientationReport: (texture: String, output: String) {
+        let o = orientation
+        return (o.textureOriginIsBottom ? "0번 행 = 아래 (뒤집힘)" : "0번 행 = 위 (그대로)",
+                o.outputNeedsFlip ? "되돌림 필요" : "그대로")
+    }
+
+    private func measureOrientation() -> Orientation {
+        var result = Orientation()
+        // 위 절반 검정 / 아래 절반 흰색. CIImage 좌표는 좌하단 원점이라
+        // y가 큰 쪽(2...4)이 '위'다.
+        let size: CGFloat = 4
+        let white = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
+            .cropped(to: CGRect(x: 0, y: 0, width: size, height: size / 2))
+        let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0))
+            .cropped(to: CGRect(x: 0, y: size / 2, width: size, height: size / 2))
+        let probe = black.composited(over: white)
+
+        // (1) 텍스처의 0번 행 직접 읽기
+        if let target = texture(4, 4, format: .rgba8Unorm, shared: true),
+           let command = queue.makeCommandBuffer() {
+            let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            ciContext.render(probe, to: target, commandBuffer: command,
+                             bounds: CGRect(x: 0, y: 0, width: 4, height: 4), colorSpace: space)
+            command.commit()
+            command.waitUntilCompleted()
+            var row = [UInt8](repeating: 0, count: 4 * 4)
+            row.withUnsafeMutableBytes { buffer in
+                target.getBytes(buffer.baseAddress!, bytesPerRow: 16,
+                                from: MTLRegionMake2D(0, 0, 4, 1), mipmapLevel: 0)
+            }
+            // 0번 행이 밝으면 그 행은 '아래'(흰색)다 → 텍스처가 뒤집혀 있다
+            result.textureOriginIsBottom = Int(row[0]) + Int(row[1]) + Int(row[2]) > 384
+        }
+
+        // (2) 출력 경로 왕복 — 플립 없이 돌려서 위가 검정으로 나오는지 본다
+        if let target = texture(4, 4, shared: false),
+           let command = queue.makeCommandBuffer() {
+            let space = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+                ?? CGColorSpaceCreateDeviceRGB()
+            ciContext.render(probe, to: target, commandBuffer: command,
+                             bounds: CGRect(x: 0, y: 0, width: 4, height: 4), colorSpace: space)
+            command.commit()
+            command.waitUntilCompleted()
+            if let image = makeCGImage(target, flip: false),
+               let topLuma = Renderer.pixelLuma(image, x: 1, y: 1) {
+                // 위가 흰색으로 나왔다 = 거꾸로 = 되돌려야 한다
+                result.outputNeedsFlip = topLuma > 0.5
+            }
+        }
+        return result
+    }
+
+    /// CGImage 의 한 픽셀을 읽는다 (좌상단 기준 좌표)
+    private static func pixelLuma(_ image: CGImage, x: Int, y: Int) -> Double? {
+        var bytes = [UInt8](repeating: 0, count: 4)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let info = CGImageAlphaInfo.premultipliedLast.rawValue
+        let luma: Double? = bytes.withUnsafeMutableBytes { buffer -> Double? in
+            guard let context = CGContext(data: buffer.baseAddress, width: 1, height: 1,
+                                          bitsPerComponent: 8, bytesPerRow: 4,
+                                          space: space, bitmapInfo: info) else { return nil }
+            // CGContext 는 좌하단 원점 — 위에서 y번째 행이 원점에 오도록 민다
+            context.draw(image, in: CGRect(x: -CGFloat(x),
+                                           y: -CGFloat(image.height - 1 - y),
+                                           width: CGFloat(image.width),
+                                           height: CGFloat(image.height)))
+            let p = buffer.bindMemory(to: UInt8.self)
+            return (Double(p[0]) + Double(p[1]) + Double(p[2])) / (3 * 255)
+        }
+        return luma
+    }
+
     // MARK: - 입력 준비
 
-    /// 깊이맵(미터)을 R32Float 텍스처로
+    /// 깊이맵(미터)을 R32Float 텍스처로.
+    ///
+    /// 색 이미지는 CoreImage 가 렌더하면서 세로가 뒤집힐 수 있는데, 깊이는
+    /// 바이트를 그대로 올리니까 그 변환을 안 탄다. 맞춰주지 않으면 가까운 바닥이
+    /// '먼 깊이'를 읽어 선명하게 남고 먼 배경이 '가까운 깊이'를 읽어 뭉개진다.
     func depthTexture(_ map: DepthMap) -> MTLTexture? {
         guard let texture = texture(map.width, map.height, format: .r32Float, shared: true) else { return nil }
-        map.values.withUnsafeBytes { raw in
+        var values = map.values
+        if textureOriginIsBottom {
+            var flipped = [Float](repeating: 0, count: values.count)
+            for y in 0..<map.height {
+                let source = (map.height - 1 - y) * map.width
+                let target = y * map.width
+                for x in 0..<map.width { flipped[target + x] = values[source + x] }
+            }
+            values = flipped
+        }
+        values.withUnsafeBytes { raw in
             texture.replace(region: MTLRegionMake2D(0, 0, map.width, map.height),
                             mipmapLevel: 0, withBytes: raw.baseAddress!,
                             bytesPerRow: map.width * 4)
@@ -362,6 +512,10 @@ final class Renderer: @unchecked Sendable {
         var autoNR: Float = 0
         /// ISO 기반 노이즈 레벨 추정 (신경망 셰이프 임계)
         var noiseFloor: Float = 0.01
+        /// EXIF 가 알려준 35mm 환산 초점거리 × 확대 배율.
+        /// 자동 화각을 켜면 이 값으로 착란원을 계산한다 — 아이폰 광각은 24mm 라서
+        /// 50mm 로 가정하면 원근과 흐림이 따로 놀아 가짜처럼 보인다.
+        var capturedFocal: Float = 24
     }
 
     /// 단계 진행 보고 — (단계 키, 그 단계 안에서의 0...1)
@@ -537,8 +691,9 @@ final class Renderer: @unchecked Sendable {
         if settings.bokehEnabled, let depth = input.depth {
             if try applyDepthOfField(source: front, destination: back, depth: depth,
                                      matte: input.matte, settings: settings, recipe: recipe,
-                                     focusDistance: input.focusDistance, report: tell,
-                                     check: check) {
+                                     focusDistance: input.focusDistance,
+                                     capturedFocal: input.capturedFocal,
+                                     report: tell, check: check) {
                 swap(&front, &back)
             }
         }
@@ -637,7 +792,12 @@ final class Renderer: @unchecked Sendable {
         let totalGain = exp2(settings.exposure + auto.autoExposure) * wbLuma
 
         // 블랙 포인트: 장면의 가장 어두운 곳을 진짜 검정으로. 베일링 플레어 제거.
-        let blackPoint = min(max(auto.blackRaw * totalGain * 0.85, 0), 0.055)
+        // 흐린 날·역광처럼 가장 어두운 곳조차 떠 있는 장면이 있어서, 상한을
+        // 장면의 실제 다이내믹 레인지에 맞춰 늘린다 (좁을수록 더 과감하게).
+        let blackCeiling = auto.dynamicRange < 7
+            ? min(0.055 + (7 - auto.dynamicRange) * 0.035, 0.16)
+            : 0.055
+        let blackPoint = min(max(auto.blackRaw * totalGain * 0.9, 0), blackCeiling)
         let invBlack = 1 / max(1 - blackPoint, 1e-3)
         // 화이트: 장면의 실제 최대 휘도를 숄더가 1.0 으로 눕힌다
         var white = (auto.whiteRaw * totalGain - blackPoint) * invBlack
@@ -654,9 +814,15 @@ final class Renderer: @unchecked Sendable {
         let highTint = Renderer.splitTint(hue: settings.splitHighHue,
                                           amount: settings.splitHighSat / 100 * 0.16)
 
+        // 장면 대비 보정: 다이내믹 레인지가 좁은 장면(흐린 날, 안개, 실내 평광)은
+        // 그대로 두면 회색 죽이 된다. 필름 현상에서 인화지 호수를 올리는 것과 같다.
+        let autoContrast: Float = recipe.sceneAnalysis
+            ? min(max((8.2 - auto.dynamicRange) * 0.055, -0.05), 0.32)
+            : 0
+
         let toneParams = ToneParams(
             exposure: settings.exposure + auto.autoExposure,
-            contrast: settings.contrast / 100,
+            contrast: settings.contrast / 100 + autoContrast,
             highlights: settings.highlights / 100,
             shadows: settings.shadows / 100,
             whites: settings.whites / 100,
@@ -796,7 +962,7 @@ final class Renderer: @unchecked Sendable {
     private func applyDepthOfField(source: MTLTexture, destination: MTLTexture,
                                    depth: MTLTexture, matte: MTLTexture?,
                                    settings: DevelopSettings, recipe: DevelopRecipe,
-                                   focusDistance: Float,
+                                   focusDistance: Float, capturedFocal: Float,
                                    report: StageReport,
                                    check: () throws -> Void) throws -> Bool {
         let width = source.width, height = source.height
@@ -805,53 +971,91 @@ final class Renderer: @unchecked Sendable {
 
         report("depth", 0)
         let longSide = max(width, height)
-        let k = min(Double(recipe.bokehSide) / Double(longSide), 1)
+        let target = recipe.bokehSide(outputLong: longSide)
+        let k = min(Double(target) / Double(longSide), 1)
         let smallW = max(Int((Double(width) * k).rounded()), 64)
         let smallH = max(Int((Double(height) * k).rounded()), 64)
 
+        // 깊이는 본질적으로 저주파라 보케 작업 해상도까지 올릴 필요가 없다.
+        // 구멍 메우기 피라미드도 여기서 돌려 메모리를 아낀다.
+        let depthLong = min(max(smallW, smallH), Renderer.depthWorkingSide)
+        let dk = Double(depthLong) / Double(max(smallW, smallH))
+        let depthW = max(Int((Double(smallW) * dk).rounded()), 48)
+        let depthH = max(Int((Double(smallH) * dk).rounded()), 48)
+
         guard let smallSrc = texture(smallW, smallH),
-              let depthHi = texture(smallW, smallH, format: .r32Float),
-              let cocRaw = texture(smallW, smallH, format: .r16Float),
-              let cocSmooth = texture(smallW, smallH, format: .r16Float) else {
+              let depthGuide = texture(depthW, depthH),
+              let depthHi = texture(depthW, depthH, format: .r32Float),
+              let cocRaw = texture(depthW, depthH, format: .r16Float),
+              let cocSmooth = texture(depthW, depthH, format: .r16Float) else {
             throw RenderError.allocation
         }
         let ratio = Float(width) / Float(smallW)
         let rotation = settings.apertureRotation * .pi / 180
+        let focal = settings.effectiveFocalLength(captured: capturedFocal)
 
         var maxRadius: Float = 0
         do {
             let command = try newCommand()
             try run("downsample_box", command, textures: [source, smallSrc],
                     params: ratio, size: (smallW, smallH))
+            try run("downsample_box", command, textures: [smallSrc, depthGuide],
+                    params: Float(smallW) / Float(depthW), size: (depthW, depthH))
 
-            // 깊이를 색상 가이드로 업샘플 (LiDAR 해상도 → 작업 해상도)
-            try run("depth_upsample", command, textures: [smallSrc, depth, depthHi],
-                    params: Float(0.12), size: (smallW, smallH))
+            // 깊이를 색상 가이드로 업샘플 (LiDAR 해상도 → 깊이 작업 해상도).
+            // 못 읽은 곳은 0(구멍)으로 남는다.
+            // 확대(크롭)한 만큼 깊이도 같은 영역만 봐야 한다.
+            // 텍스처가 아래부터 채워졌으면 y 는 아래 기준으로 센다.
+            let region = settings.cropRegion
+            let originY = textureOriginIsBottom
+                ? (1 - Float(region.origin.y) - Float(region.height))
+                : Float(region.origin.y)
+            let upsample = UpsampleParams(
+                sigmaColor: 0.12,
+                scaleX: Float(region.width), scaleY: Float(region.height),
+                offsetX: Float(region.origin.x), offsetY: originY,
+                rotation: Float(settings.depthRotation),
+                mirror: settings.depthMirror ? 1 : 0)
+            try run("depth_upsample", command, textures: [depthGuide, depth, depthHi],
+                    params: upsample, size: (depthW, depthH))
+            finish(command)
+        }
+        report("depth", 0.35)
 
-            var depthFinal = depthHi
+        // LiDAR 사거리 밖은 전부 구멍이다 — push-pull 로 메운다
+        guard let filled = try fillDepthHoles(depthHi) else { throw RenderError.allocation }
+        report("depth", 0.7)
+
+        do {
+            let command = try newCommand()
+            var depthFinal = filled
             if let matte, recipe.subjectMask {
-                guard let refined = texture(smallW, smallH, format: .r32Float) else {
+                guard let refined = texture(depthW, depthH, format: .r32Float) else {
                     throw RenderError.allocation
                 }
-                try run("depth_refine_matte", command, textures: [depthHi, matte, refined],
-                        params: focus, size: (smallW, smallH))
+                try run("depth_refine_matte", command, textures: [filled, matte, refined],
+                        params: focus, size: (depthW, depthH))
                 depthFinal = refined
             }
 
+            // 착란원은 '보케 작업 해상도 픽셀' 단위로 적는다. 텍스처 자체는 더
+            // 작아도 되는데, 마칭/게더가 정규화 좌표로 읽기 때문이다.
             let cocParams = CoCParams(
                 focusDistance: focus,
-                focalLength: settings.focalLength,
+                focalLength: focal,
                 fNumber: settings.fNumber,
                 sensorWidth: 36,
                 imageWidth: Float(smallW),
-                maxCoC: 150)
+                maxCoC: 220,
+                scale: settings.bokehScale)
             try run("coc_from_depth", command, textures: [depthFinal, cocRaw],
-                    params: cocParams, size: (smallW, smallH))
-            try run("coc_smooth", command, textures: [cocRaw, cocSmooth], size: (smallW, smallH))
+                    params: cocParams, size: (depthW, depthH))
+            try run("coc_smooth", command, textures: [cocRaw, cocSmooth], size: (depthW, depthH))
             finish(command)
 
             maxRadius = min(Renderer.maxCoCPixels(settings: settings, focus: focus,
-                                                  imageWidth: Float(smallW)), 150)
+                                                  focalLength: focal,
+                                                  imageWidth: Float(smallW)), 220)
         }
         report("depth", 1)
         guard maxRadius >= 1 else { return false }
@@ -883,17 +1087,63 @@ final class Renderer: @unchecked Sendable {
         // 풀해상도 합성 — CoC 를 풀해상도 픽셀 단위로 환산한 사본을 쓴다
         do {
             let command = try newCommand()
-            guard let cocForComposite = texture(smallW, smallH, format: .r16Float) else {
+            guard let cocForComposite = texture(depthW, depthH, format: .r16Float) else {
                 throw RenderError.allocation
             }
             try run("downsample_coc", command, textures: [cocSmooth, cocForComposite],
-                    params: ratio, size: (smallW, smallH))
+                    params: ratio, size: (depthW, depthH))
+            let composite = CompositeParams(upscale: Float(width) / Float(smallW))
             try run("bokeh_composite", command,
                     textures: [source, blurred, cocForComposite, destination],
-                    size: (width, height))
+                    params: composite, size: (width, height))
             finish(command)
         }
         return true
+    }
+
+    /// LiDAR 가 못 읽은 구멍을 push-pull 피라미드로 메운다.
+    /// 유효한 값만 모아 올리고(pull), 내려오면서 구멍만 채운다(push).
+    private func fillDepthHoles(_ source: MTLTexture) throws -> MTLTexture? {
+        let w = source.width, h = source.height
+        guard let base = texture(w, h, format: .rg16Float) else { return nil }
+        do {
+            let command = try newCommand()
+            try run("depth_pack", command, textures: [source, base], size: (w, h))
+            finish(command)
+        }
+
+        // 피라미드 올리기
+        var levels: [MTLTexture] = [base]
+        var lw = w, lh = h
+        while lw > 8 || lh > 8 {
+            lw = max(lw / 2, 1); lh = max(lh / 2, 1)
+            guard let next = texture(lw, lh, format: .rg16Float) else { break }
+            let command = try newCommand()
+            try run("depth_pull", command, textures: [levels[levels.count - 1], next],
+                    size: (lw, lh))
+            finish(command)
+            levels.append(next)
+            if levels.count > 14 { break }
+        }
+
+        // 내려오면서 구멍 메우기
+        var carried = levels[levels.count - 1]
+        for index in stride(from: levels.count - 2, through: 0, by: -1) {
+            let fine = levels[index]
+            guard let merged = texture(fine.width, fine.height, format: .rg16Float) else { break }
+            let command = try newCommand()
+            try run("depth_push", command, textures: [fine, carried, merged],
+                    size: (fine.width, fine.height))
+            finish(command)
+            carried = merged
+        }
+
+        guard let result = texture(w, h, format: .r32Float) else { return nil }
+        let command = try newCommand()
+        try run("depth_unpack", command, textures: [carried, result],
+                params: Float(400), size: (w, h))
+        finish(command)
+        return result
     }
 
     /// 조리개 위의 광선을 깊이 버퍼에 마칭한다. 샘플을 조금씩 끊어 쏘면서
@@ -1005,12 +1255,13 @@ final class Renderer: @unchecked Sendable {
     }
 
     /// 장면에서 나올 수 있는 최대 착란원(px). 게더/마칭 반경을 정하는 데 쓴다.
-    static func maxCoCPixels(settings: DevelopSettings, focus: Float, imageWidth: Float) -> Float {
-        let f = settings.focalLength
+    static func maxCoCPixels(settings: DevelopSettings, focus: Float,
+                             focalLength: Float, imageWidth: Float) -> Float {
+        let f = focalLength
         let s1 = focus * 1000
         // 무한대 배경이 가장 크게 흐려진다
         let cocMM = (f * f / max(settings.fNumber, 0.7)) / max(s1 - f, 1)
-        return min(cocMM / 36 * imageWidth, 460)
+        return min(cocMM / 36 * imageWidth * max(settings.bokehScale, 0), 700)
     }
 
     // MARK: - 벤치마크
@@ -1123,23 +1374,27 @@ final class Renderer: @unchecked Sendable {
         CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
     }
 
-    private func flipped(_ texture: MTLTexture) -> CIImage? {
+    private func outputImage(_ texture: MTLTexture, flip: Bool) -> CIImage? {
         guard let image = CIImage(mtlTexture: texture, options: [.colorSpace: outputSpace]) else {
             return nil
         }
-        // Metal 텍스처는 위아래가 뒤집혀 있다
+        guard flip else { return image }
         return image.transformed(by: CGAffineTransform(scaleX: 1, y: -1)
             .translatedBy(x: 0, y: -image.extent.height))
     }
 
-    func cgImage(from texture: MTLTexture) -> CGImage? {
-        guard let image = flipped(texture) else { return nil }
+    private func makeCGImage(_ texture: MTLTexture, flip: Bool) -> CGImage? {
+        guard let image = outputImage(texture, flip: flip) else { return nil }
         return ciContext.createCGImage(image, from: image.extent,
                                        format: .RGBA8, colorSpace: outputSpace)
     }
 
+    func cgImage(from texture: MTLTexture) -> CGImage? {
+        makeCGImage(texture, flip: outputNeedsFlip)
+    }
+
     func jpegData(from texture: MTLTexture, quality: CGFloat = 0.95) -> Data? {
-        guard let image = flipped(texture) else { return nil }
+        guard let image = outputImage(texture, flip: outputNeedsFlip) else { return nil }
         return ciContext.jpegRepresentation(of: image, colorSpace: outputSpace,
                                             options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality])
     }

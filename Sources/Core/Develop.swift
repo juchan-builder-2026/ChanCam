@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// 현상 설정. Lightroom 슬라이더와 같은 의미/범위를 쓴다.
@@ -49,8 +50,22 @@ struct DevelopSettings: Codable, Equatable {
     var fNumber: Float = 1.8
     /// 초점 거리(m). 0 이면 촬영 시 LiDAR 초점 거리 사용
     var focusDistance: Float = 0
-    /// 35mm 환산 초점거리. 보케 크기를 결정. 네 렌즈와 같은 50mm 기본
+    /// 화각 자동 인식 — EXIF 의 35mm 환산 초점거리 × 확대 배율을 쓴다.
+    /// 아이폰 광각은 24mm 인데 50mm 로 가정하고 흐림을 계산하면 원근(넓은 화각)과
+    /// 흐림(망원)이 따로 놀아서 가짜처럼 보인다. 이걸 끄면 focalLength 를 쓴다.
+    var autoFocalLength = true
+    /// 35mm 환산 초점거리 (수동). 자동이 꺼졌을 때만 쓴다.
     var focalLength: Float = 50
+    /// 확대(크롭) 배율. 24mm 를 2.1배 자르면 정확히 50mm 가 보는 화각이 된다 —
+    /// 그래서 확대를 하면 얇은 렌즈 공식이 비로소 앞뒤가 맞는다.
+    var zoom: Float = 1            // 1.0 ... 4.0
+    var zoomCenterX: Float = 0.5   // 0 ... 1
+    var zoomCenterY: Float = 0.5
+    /// 물리값 위에 얹는 보케 과장 배율. 1.0 = 계산 그대로.
+    var bokehScale: Float = 1      // 0.25 ... 4
+    /// 깊이맵 방향 보정 (0,1,2,3 = 0°,90°,180°,270°). 보케가 엉뚱한 데 걸리면 여기서.
+    var depthRotation: Int = 0
+    var depthMirror = false
     /// 조리개 날 수 (0 = 완전 원형). 소니 FE 50 F1.8 은 7 날
     var apertureBlades: Int = 7
     /// 날 곡률. 0 = 직선 다각형, 1 = 원형
@@ -89,6 +104,113 @@ struct DevelopSettings: Codable, Equatable {
     // MARK: 지오메트리
     var rotation: Float = 0        // -45 ... +45 도
     var cropRect: CropRect = .full
+
+    init() {}
+
+    /// 관대한 디코딩.
+    ///
+    /// Swift 가 자동으로 만들어 주는 `init(from:)` 은 키가 하나라도 없으면 통째로
+    /// 실패한다. 그러면 shots.json 전체 디코딩이 깨져서 **보관함이 빈 채로 뜬다.**
+    /// 업데이트할 때마다 설정을 추가하는 앱이라 그건 치명적이라서, 없는 키는
+    /// 기본값을 쓰도록 직접 쓴다. 모르는 키가 들어와도 무시한다.
+    init(from decoder: Decoder) throws {
+        self.init()
+        guard let c = try? decoder.container(keyedBy: CodingKeys.self) else { return }
+        func f(_ key: CodingKeys, _ current: Float) -> Float {
+            (try? c.decodeIfPresent(Float.self, forKey: key)) .flatMap { $0 } ?? current
+        }
+        func i(_ key: CodingKeys, _ current: Int) -> Int {
+            (try? c.decodeIfPresent(Int.self, forKey: key)) .flatMap { $0 } ?? current
+        }
+        func b(_ key: CodingKeys, _ current: Bool) -> Bool {
+            (try? c.decodeIfPresent(Bool.self, forKey: key)) .flatMap { $0 } ?? current
+        }
+
+        exposure = f(.exposure, exposure)
+        contrast = f(.contrast, contrast)
+        highlights = f(.highlights, highlights)
+        shadows = f(.shadows, shadows)
+        whites = f(.whites, whites)
+        blacks = f(.blacks, blacks)
+        dehaze = f(.dehaze, dehaze)
+        localContrast = f(.localContrast, localContrast)
+
+        temperature = f(.temperature, temperature)
+        tint = f(.tint, tint)
+        vibrance = f(.vibrance, vibrance)
+        saturation = f(.saturation, saturation)
+        skinProtect = f(.skinProtect, skinProtect)
+
+        splitShadowHue = f(.splitShadowHue, splitShadowHue)
+        splitShadowSat = f(.splitShadowSat, splitShadowSat)
+        splitHighHue = f(.splitHighHue, splitHighHue)
+        splitHighSat = f(.splitHighSat, splitHighSat)
+        splitBalance = f(.splitBalance, splitBalance)
+
+        texture = f(.texture, texture)
+        clarity = f(.clarity, clarity)
+        sharpness = f(.sharpness, sharpness)
+        sharpenRadius = f(.sharpenRadius, sharpenRadius)
+        luminanceNR = f(.luminanceNR, luminanceNR)
+        colorNR = f(.colorNR, colorNR)
+
+        bokehEnabled = b(.bokehEnabled, bokehEnabled)
+        fNumber = f(.fNumber, fNumber)
+        focusDistance = f(.focusDistance, focusDistance)
+        autoFocalLength = b(.autoFocalLength, autoFocalLength)
+        focalLength = f(.focalLength, focalLength)
+        zoom = f(.zoom, zoom)
+        zoomCenterX = f(.zoomCenterX, zoomCenterX)
+        zoomCenterY = f(.zoomCenterY, zoomCenterY)
+        bokehScale = f(.bokehScale, bokehScale)
+        depthRotation = i(.depthRotation, depthRotation)
+        depthMirror = b(.depthMirror, depthMirror)
+        apertureBlades = i(.apertureBlades, apertureBlades)
+        bladeCurvature = f(.bladeCurvature, bladeCurvature)
+        highlightBloom = f(.highlightBloom, highlightBloom)
+        catsEye = f(.catsEye, catsEye)
+        bokehRing = f(.bokehRing, bokehRing)
+        apodization = f(.apodization, apodization)
+        longitudinalCA = f(.longitudinalCA, longitudinalCA)
+        apertureRotation = f(.apertureRotation, apertureRotation)
+
+        flare = f(.flare, flare)
+        ghostCount = f(.ghostCount, ghostCount)
+        ghostStrength = f(.ghostStrength, ghostStrength)
+        haloStrength = f(.haloStrength, haloStrength)
+        glareStrength = f(.glareStrength, glareStrength)
+        spikeStrength = f(.spikeStrength, spikeStrength)
+
+        vignette = f(.vignette, vignette)
+        grain = f(.grain, grain)
+        grainSize = f(.grainSize, grainSize)
+        chromaticAberration = f(.chromaticAberration, chromaticAberration)
+        coma = f(.coma, coma)
+
+        rotation = f(.rotation, rotation)
+        if let saved = try? c.decodeIfPresent(CropRect.self, forKey: .cropRect), let saved {
+            cropRect = saved
+        }
+    }
+
+    /// 실제로 착란원 계산에 들어가는 35mm 환산 초점거리.
+    /// 자동이면 '찍을 때 화각 × 확대 배율' — 크롭한 만큼 망원이 되는 게 맞다.
+    func effectiveFocalLength(captured: Float) -> Float {
+        let base = autoFocalLength ? max(captured, 8) : focalLength
+        return min(max(base * max(zoom, 1), 8), 400)
+    }
+
+    /// 확대했을 때 잘라낼 영역 (정규화). 가운데를 기준으로 1/zoom 만큼 남긴다.
+    var cropRegion: CGRect {
+        let z = CGFloat(min(max(zoom, 1), 8))
+        guard z > 1.001 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        let size = 1 / z
+        let cx = CGFloat(min(max(zoomCenterX, 0), 1))
+        let cy = CGFloat(min(max(zoomCenterY, 0), 1))
+        let x = min(max(cx - size / 2, 0), 1 - size)
+        let y = min(max(cy - size / 2, 0), 1 - size)
+        return CGRect(x: x, y: y, width: size, height: size)
+    }
 
     /// 주찬님 기본 룩 (샘플 평균)
     static let chan = DevelopSettings()
@@ -140,6 +262,8 @@ struct DevelopSettings: Codable, Equatable {
         portrait.luminanceNR = 18
         portrait.colorNR = 30
         portrait.fNumber = 1.8
+        // 24mm 를 2.1배 자르면 정확히 50mm 화각 — 그래야 원근과 흐림이 같은 렌즈를 말한다
+        portrait.zoom = 2.1
         portrait.highlightBloom = 1.15
         portrait.catsEye = 0.7
         portrait.vignette = -14
@@ -315,7 +439,7 @@ enum EditorGroup: String, CaseIterable, Identifiable {
         case .detail:
             return "신경망 디테일 세기는 현상 시작 화면에서 고르세요. 여기 값들은 그 위에 더해지는 고전 샤프닝이에요."
         case .lens:
-            return "조리개·초점 거리는 얇은 렌즈 공식으로 착란원을 계산해요. 실제 렌즈와 같은 숫자를 넣으면 같은 흐림이 나와요."
+            return "화각은 EXIF 에서 자동으로 읽어요(아이폰 광각 = 24mm). 확대를 올리면 그만큼 잘라내고 환산 화각도 같이 올라가요 — 2.1× 면 정확히 50mm 가 보는 그림이고, 그래야 원근과 흐림이 같은 렌즈를 말해요. 보케가 엉뚱한 데 걸리면 아래 '깊이 방향'을 돌려보세요."
         case .optics:
             return "광원이 렌즈 안에서 반사·회절되며 만드는 것들이에요. 밝은 점광원이 화면에 있을 때만 보여요."
         case .effect:
@@ -360,9 +484,11 @@ enum EditorGroup: String, CaseIterable, Identifiable {
             ]
         case .lens:
             return [
-                Slider1D(name: "조리개", range: 1.0...16, neutral: 1.8, key: \.fNumber, step: 0.1),
+                Slider1D(name: "확대", range: 1...4, neutral: 1, key: \.zoom, step: 0.05, unit: "×"),
+                Slider1D(name: "조리개", range: 0.7...16, neutral: 1.8, key: \.fNumber, step: 0.1),
+                Slider1D(name: "보케 배율", range: 0.25...4, neutral: 1, key: \.bokehScale, step: 0.05, unit: "×"),
                 Slider1D(name: "초점 거리", range: 0...10, neutral: 0, key: \.focusDistance, step: 0.05, unit: "m"),
-                Slider1D(name: "환산 화각", range: 24...135, neutral: 50, key: \.focalLength, step: 1, unit: "mm"),
+                Slider1D(name: "환산 화각(수동)", range: 12...200, neutral: 50, key: \.focalLength, step: 1, unit: "mm"),
                 Slider1D(name: "조리개 곡률", range: 0...1, neutral: 1, key: \.bladeCurvature, step: 0.05),
                 Slider1D(name: "조리개 회전", range: 0...90, neutral: 0, key: \.apertureRotation, step: 1, unit: "°"),
                 Slider1D(name: "아포다이제이션", range: 0...1, neutral: 0, key: \.apodization, step: 0.02),

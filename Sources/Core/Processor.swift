@@ -43,8 +43,16 @@ final class CancelFlag: @unchecked Sendable {
     func clear() { lock.lock(); value = false; lock.unlock() }
 }
 
+/// 단계별 실제 소요 시간 — 어디서 시간이 갔는지 끝나고 보여준다
+struct StageTime: Equatable, Identifiable {
+    var name: String
+    var seconds: Double
+    var id: String { name }
+}
+
 /// 현상 한 번(한 장 또는 여러 장)의 진행 상태
 struct BatchProgress: Equatable {
+    var stageTimes: [StageTime] = []
     var total = 0
     var finished = 0
     var failed = 0
@@ -282,15 +290,35 @@ final class Processor: ObservableObject {
     }
 
     /// 현상에 필요한 입력 일체를 준비
-    nonisolated func makeInput(shot: Shot, rawURL: URL, depth: DepthMap?, matteImage: CIImage?,
+    nonisolated func makeInput(shot: Shot, settings: DevelopSettings, rawURL: URL,
+                               depth: DepthMap?, matteImage: CIImage?,
                                targetLongSide: Int, bokehSide: Int,
                                analyze: Bool,
                                publish: (String, Double) -> Void = { _, _ in }) throws -> Renderer.Input {
         let fullLong = max(shot.pixelWidth, shot.pixelHeight)
-        let scale = fullLong > 0 ? min(Float(targetLongSide) / Float(fullLong), 1) : 1
+        let zoom = max(min(settings.zoom, 8), 1)
+        // 잘라낸 뒤의 크기가 목표 해상도가 되도록, 디코드는 확대 배율만큼 더 크게
+        let scale = fullLong > 0
+            ? min(Float(targetLongSide) * zoom / Float(fullLong), 1)
+            : 1
         publish("decode", 0.15)
-        let image = try decode(url: rawURL, scale: scale)
-        publish("decode", 0.7)
+        var image = try decode(url: rawURL, scale: scale)
+        publish("decode", 0.6)
+
+        // 확대 = 크롭. 크롭한 만큼 환산 화각이 올라가서 얇은 렌즈 공식이 앞뒤가 맞는다.
+        let region = settings.cropRegion
+        if region.width < 0.999 || region.height < 0.999 {
+            let e = image.extent
+            // CIImage 는 좌하단 원점이라 y 를 뒤집어 센다
+            let rect = CGRect(x: e.minX + region.origin.x * e.width,
+                              y: e.minY + (1 - region.origin.y - region.height) * e.height,
+                              width: region.width * e.width,
+                              height: region.height * e.height)
+            image = image.cropped(to: rect.integral)
+            image = image.transformed(by: CGAffineTransform(translationX: -image.extent.origin.x,
+                                                            y: -image.extent.origin.y))
+        }
+        publish("decode", 0.78)
 
         let extent = image.extent
         var width = Int(extent.width.rounded())
@@ -329,12 +357,15 @@ final class Processor: ObservableObject {
         input.auto = analyze ? (renderer?.analyze(linear) ?? .neutral) : .neutral
         input.autoNR = Processor.autoNoise(iso: shot.iso)
         input.noiseFloor = Processor.noiseFloor(iso: shot.iso)
+        // EXIF 가 알려준 실제 화각. 아이폰 광각은 24mm 다.
+        input.capturedFocal = shot.focalLength35 > 1 ? shot.focalLength35 : 24
         publish("analyze", 1)
         return input
     }
 
     /// 현상에 쓸 입력 한 벌 (매트 생성 포함). work 큐에서만 부른다.
-    nonisolated private func prepare(shot: Shot, paths: Paths, recipe: DevelopRecipe,
+    nonisolated private func prepare(shot: Shot, settings: DevelopSettings, paths: Paths,
+                                     recipe: DevelopRecipe,
                                      targetLongSide: Int, needsMatte: Bool,
                                      publish: (String, Double) -> Void = { _, _ in })
         throws -> Renderer.Input {
@@ -345,7 +376,7 @@ final class Processor: ObservableObject {
             matte = Processor.personMatte(previewURL: preview, cacheURL: paths.matteCache)
             publish("mask", 1)
         }
-        return try makeInput(shot: shot, rawURL: paths.raw, depth: depth,
+        return try makeInput(shot: shot, settings: settings, rawURL: paths.raw, depth: depth,
                              matteImage: matte, targetLongSide: targetLongSide,
                              bokehSide: recipe.bokehSide, analyze: recipe.sceneAnalysis,
                              publish: publish)
@@ -377,23 +408,48 @@ final class Processor: ObservableObject {
     /// 그림의 성격은 같고 보케 디스크만 조금 거칠다.
     private var previewRecipe: DevelopRecipe {
         var light = recipe
+        if light.tier == .extreme { light.tier = .advanced }
         light.apertureSamples = min(recipe.apertureSamples, 16)
         light.marchSteps = min(recipe.marchSteps, 12)
         light.neuralScales = min(recipe.neuralScales, 2)
         return light
     }
 
+    // MARK: - 단계 시간 기록
+
+    private var stageStart = Date()
+
+    private func noteStage(_ name: String) {
+        guard var current = batch else { return }
+        if current.stage != name {
+            let elapsed = Date().timeIntervalSince(stageStart)
+            if elapsed > 0.005, !current.stage.isEmpty, current.stage != "시작" {
+                if let index = current.stageTimes.firstIndex(where: { $0.name == current.stage }) {
+                    current.stageTimes[index].seconds += elapsed
+                } else {
+                    current.stageTimes.append(StageTime(name: current.stage, seconds: elapsed))
+                }
+            }
+            stageStart = Date()
+            current.stage = name
+        }
+        batch = current
+    }
+
     func preview(shot: Shot, settings: DevelopSettings, longSide: Int = 2000) async -> CGImage? {
         guard let renderer, let paths = paths(for: shot, useExportAsSource: true) else { return nil }
         let light = previewRecipe
-        let key = "\(shot.id.uuidString)-\(longSide)"
+        // 확대 배율이 바뀌면 다시 디코드해야 한다 — 캐시 키에 넣는다
+        let zoomKey = Int((settings.zoom * 20).rounded())
+        let key = "\(shot.id.uuidString)-\(longSide)-\(zoomKey)"
         let wantsMatte = settings.bokehEnabled && light.subjectMask
         return await withCheckedContinuation { continuation in
             work.async {
                 do {
                     var input = self.cache.lookup(key)
                     if input == nil || (wantsMatte && input?.matte == nil) {
-                        input = try self.prepare(shot: shot, paths: paths, recipe: light,
+                        input = try self.prepare(shot: shot, settings: settings, paths: paths,
+                                                 recipe: light,
                                                  targetLongSide: longSide, needsMatte: wantsMatte)
                         self.cache.store(key, input!)
                     }
@@ -423,6 +479,7 @@ final class Processor: ObservableObject {
         progress.total = shots.count
         progress.stage = "시작"
         batch = progress
+        stageStart = Date()
         for shot in shots { jobs[shot.id] = .queued }
         SystemMonitor.shared.reset()
         SystemMonitor.shared.start()
@@ -456,10 +513,10 @@ final class Processor: ObservableObject {
             batch?.fraction = 0
             if !ok { batch?.failed += 1 }
         }
+        noteStage(flag.isSet ? "취소됨" : "완료")
         running = false
         batch?.isRunning = false
         batch?.endedAt = Date()
-        batch?.stage = flag.isSet ? "취소됨" : "완료"
         batch?.fraction = flag.isSet ? 0 : 1
         if flag.isSet {
             for (id, state) in jobs where state == .queued { jobs[id] = nil }
@@ -514,13 +571,14 @@ final class Processor: ObservableObject {
                     lastPublished = now
                     Task { @MainActor in
                         self.jobs[id] = .running(stage: name, progress: fraction)
-                        self.batch?.stage = name
+                        self.noteStage(name)
                         self.batch?.fraction = fraction
                     }
                 }
 
                 do {
-                    let input = try self.prepare(shot: current, paths: paths, recipe: activeRecipe,
+                    let input = try self.prepare(shot: current, settings: settings, paths: paths,
+                                                 recipe: activeRecipe,
                                                  targetLongSide: target, needsMatte: needsMatte,
                                                  publish: { key, local in publish(key, local) })
                     if cancelFlag.isSet { throw RenderError.cancelled }
