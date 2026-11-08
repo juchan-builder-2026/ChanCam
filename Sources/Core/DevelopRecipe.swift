@@ -132,7 +132,8 @@ struct DevelopRecipe: Codable, Equatable {
     var neuralDetail = true
     var neuralScales = 3
     var neuralStrength: Float = 0.55
-    var neuralDenoise: Float = 0.5
+    /// 세 스케일에 걸쳐 쌓이기 때문에 조금만 올려도 금방 물러진다. 0.3 이 기본.
+    var neuralDenoise: Float = 0.3
     var neuralInhibition: Float = 0.6
     var neuralEdgeBoost: Float = 0.25
 

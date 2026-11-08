@@ -551,38 +551,82 @@ kernel void bokeh_composite(texture2d<float, access::sample> sharp  [[texture(0)
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    float2 uv = (float2(gid) + 0.5f) / float2(w, h);
+    float2 size = float2(w, h);
+    float2 uv = (float2(gid) + 0.5f) / size;
     float3 a = sharp.sample(kLinear, uv).rgb;
     float c = abs(coc.sample(kLinear, uv).r);
-    // CoC 1px 미만은 선명하게, 3px 이상은 완전히 블러
-    float t = smoothstep(0.8f, 3.0f, c);
-    if (t <= 0.002f) { dst.write(float4(a, 1), gid); return; }
 
-    float3 b;
-    if (P.upscale <= 1.05f) {
-        b = blurred.sample(kLinear, uv).rgb;
-    } else {
-        float2 bStep = 1.0f / float2(blurred.get_width(), blurred.get_height());
-        float guideL = luma(a);
-        // 흐림이 깊어질수록 가이드를 덜 믿는다
-        float trust = 1.0f - smoothstep(2.5f, 10.0f, c);
+    // 초점면은 손대지 않는다 — 여기가 칼같이 선명해야 '진짜 렌즈'로 보인다
+    if (c < 0.7f) { dst.write(float4(a, 1), gid); return; }
+
+    float nearLimit = max(P.nearLimit, 4.0f);
+
+    // ── 초점면 근처: 풀해상도에서 직접 흐린다 ────────────────────────────
+    //
+    // 예전엔 착란원이 2px 만 돼도 저해상도 보케 층을 섞었다. 그 층은 출력의
+    // 절반 해상도라 확대하면 뭉개진다. 그래서 '살짝 흐림'이어야 할 띠가 통째로
+    // 죽었고, 사진 전체에 쨍한 데가 하나도 없었다. (v1.4 까지의 진짜 문제)
+    //
+    // 반경 c/2 짜리 디스크를 원본 해상도에서 직접 적분하면 그게 바로 물리적으로
+    // 정확한 디포커스다. 싸고, 정확하고, 초점면이 살아난다.
+    float3 nearBlur = a;
+    if (c < nearLimit * 1.4f) {
+        float radius = c * 0.5f;
+        int taps = int(clamp(radius * 4.0f, 8.0f, 44.0f));
+        float jitter = hash12(float2(gid) * 1.31f) * 6.2831853f;
         float3 acc = 0.0f;
         float wsum = 0.0f;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                float3 s = blurred.sample(kLinear, uv + float2(dx, dy) * bStep).rgb;
-                float wgt = (dx == 0 && dy == 0) ? 2.0f : ((dx == 0 || dy == 0) ? 1.0f : 0.6f);
-                if (trust > 0.01f) {
-                    float dl = (luma(s) - guideL) / 0.22f;
-                    wgt *= mix(1.0f, exp(-0.5f * dl * dl), trust);
-                }
-                acc += s * wgt;
-                wsum += wgt;
-            }
+        for (int i = 0; i < taps; ++i) {
+            float t = (float(i) + 0.5f) / float(taps);
+            float rad = sqrt(t) * radius;
+            float ang = float(i) * 2.39996323f + jitter + P.rotation;
+            float shape = apertureRadius(ang, P.blades, P.curvature);
+            float2 off = float2(cos(ang), sin(ang)) * rad * shape;
+            float3 s = sharp.sample(kLinear, uv + off / size).rgb;
+            // 이 샘플의 흐림 디스크가 여기까지 닿을 때만 기여한다 —
+            // 초점 맞은 앞쪽 물체가 뒤로 번지지 않게 하는 조건
+            float sc = abs(coc.sample(kLinear, uv + off / size).r);
+            float reach = saturate((sc * 0.5f - length(off)) * 0.7f + 0.95f);
+            acc += s * reach;
+            wsum += reach;
         }
-        b = acc / max(wsum, 1e-5f);
+        nearBlur = (wsum > 1e-4f) ? (acc / wsum) : a;
     }
-    dst.write(float4(mix(a, b, t), 1), gid);
+
+    // 0.7px 부터 1.8px 까지는 선명함에서 디스크로 부드럽게 넘어간다
+    float3 result = mix(a, nearBlur, smoothstep(0.7f, 1.8f, c));
+
+    // ── 깊은 흐림: 레이트레이싱 층 ───────────────────────────────────────
+    float farMix = smoothstep(nearLimit * 0.85f, nearLimit * 1.4f, c);
+    if (farMix > 0.002f) {
+        float3 b;
+        if (P.upscale <= 1.05f) {
+            b = blurred.sample(kLinear, uv).rgb;
+        } else {
+            float2 bStep = 1.0f / float2(blurred.get_width(), blurred.get_height());
+            float guideL = luma(a);
+            // 흐림이 깊어질수록 가이드를 덜 믿는다 (거기엔 쓸 정보가 없다)
+            float trust = 1.0f - smoothstep(nearLimit, nearLimit * 4.0f, c);
+            float3 acc = 0.0f;
+            float wsum = 0.0f;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    float3 s = blurred.sample(kLinear, uv + float2(dx, dy) * bStep).rgb;
+                    float wgt = (dx == 0 && dy == 0) ? 2.0f : ((dx == 0 || dy == 0) ? 1.0f : 0.6f);
+                    if (trust > 0.01f) {
+                        float dl = (luma(s) - guideL) / 0.22f;
+                        wgt *= mix(1.0f, exp(-0.5f * dl * dl), trust);
+                    }
+                    acc += s * wgt;
+                    wsum += wgt;
+                }
+            }
+            b = acc / max(wsum, 1e-5f);
+        }
+        result = mix(result, b, farMix);
+    }
+
+    dst.write(float4(result, 1), gid);
 }
 
 // ---------------------------------------------------------------------------

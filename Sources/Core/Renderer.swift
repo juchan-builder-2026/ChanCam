@@ -90,9 +90,20 @@ struct UpsampleParams {
 
 struct CompositeParams {
     var upscale: Float = 1
+    var nearLimit: Float = 8
+    var blades: Float = 7
+    var curvature: Float = 0.75
+    var rotation: Float = 0
     var pad0: Float = 0
     var pad1: Float = 0
     var pad2: Float = 0
+}
+
+struct DebugParams {
+    var lo: Float = 0
+    var hi: Float = 1
+    var mode: Float = 0
+    var pad0: Float = 0
 }
 
 struct FinishParams {
@@ -512,6 +523,9 @@ final class Renderer: @unchecked Sendable {
         var autoNR: Float = 0
         /// ISO 기반 노이즈 레벨 추정 (신경망 셰이프 임계)
         var noiseFloor: Float = 0.01
+        /// CPU 쪽 깊이맵 원본. 초점 지점을 바꿀 때 RAW 를 다시 디코드하지 않고
+        /// 거리만 다시 재려고 들고 있는다.
+        var depthMap: DepthMap?
         /// EXIF 가 알려준 35mm 환산 초점거리 × 확대 배율.
         /// 자동 화각을 켜면 이 값으로 착란원을 계산한다 — 아이폰 광각은 24mm 라서
         /// 50mm 로 가정하면 원근과 흐림이 따로 놀아 가짜처럼 보인다.
@@ -653,7 +667,7 @@ final class Renderer: @unchecked Sendable {
             texture: settings.texture / 100,
             clarity: settings.clarity / 100,
             lumaNR: max(settings.luminanceNR / 100, input.autoNR),
-            colorNR: max(settings.colorNR / 100, input.autoNR * 1.4))
+            colorNR: min(max(settings.colorNR / 100, input.autoNR * 1.2), 0.7))
 
         // ── 1) 노이즈 제거 ──────────────────────────────────────────────
         //    휘도는 풀해상도 3x3 바이래터럴, 색도는 1/4 해상도에서 넓게.
@@ -1099,7 +1113,14 @@ final class Renderer: @unchecked Sendable {
             }
             try run("downsample_coc", command, textures: [cocSmooth, cocForComposite],
                     params: ratio, size: (depthW, depthH))
-            let composite = CompositeParams(upscale: Float(width) / Float(smallW))
+            // 저해상도 층은 확대한 만큼 못 믿는다. 그 아래 착란원은 풀해상도에서 직접 흐린다.
+            let upscale = Float(width) / Float(smallW)
+            let composite = CompositeParams(
+                upscale: upscale,
+                nearLimit: max(6, upscale * 5),
+                blades: Float(settings.apertureBlades),
+                curvature: settings.bladeCurvature,
+                rotation: rotation)
             try run("bokeh_composite", command,
                     textures: [source, blurred, cocForComposite, destination],
                     params: composite, size: (width, height))
@@ -1111,6 +1132,130 @@ final class Renderer: @unchecked Sendable {
     /// 구멍을 메울 수 있는 최대 반경 (깊이 작업 해상도 기준 픽셀).
     /// 이보다 큰 구멍은 '메울 근거가 없는 곳' = LiDAR 사거리 밖 = 무한대로 둔다.
     static let depthFillLevels = 5
+
+    // MARK: - 진단
+
+    /// 현상이 실제로 무엇을 보고 있는지 그림으로 뽑는다.
+    /// 사진 결과만 보고 원인을 추리하는 건 느리고 자주 틀린다.
+    struct Diagnostics {
+        var depthRaw: CGImage?        // 업샘플 직후 (구멍이 빨갛게 보인다)
+        var depthFilled: CGImage?     // 구멍 메운 뒤
+        var coc: CGImage?             // 착란원 (초록=초점, 빨강=전경, 파랑=배경)
+        var matte: CGImage?           // 피사체 마스크
+        var focusDistance: Float = 0
+        var effectiveFocal: Float = 0
+        var maxRadius: Float = 0
+        var nearLimit: Float = 0
+        var validRatio: Float = 0
+        var nearDepth: Float = 0
+        var farDepth: Float = 0
+        var autoNR: Float = 0
+        var bokehSide: Int = 0
+        var outputLong: Int = 0
+    }
+
+    func diagnose(_ input: Input, _ settings: DevelopSettings,
+                  recipe: DevelopRecipe) -> Diagnostics {
+        var out = Diagnostics()
+        out.focusDistance = input.focusDistance
+        out.autoNR = input.autoNR
+        out.outputLong = max(input.linear.width, input.linear.height)
+        out.bokehSide = recipe.bokehSide(outputLong: out.outputLong)
+        let focal = settings.effectiveFocalLength(captured: input.capturedFocal)
+        out.effectiveFocal = focal
+        if let map = input.depthMap {
+            let stats = map.stats()
+            out.validRatio = stats.valid
+            out.nearDepth = stats.near
+            out.farDepth = stats.far
+        }
+        guard let depth = input.depth else { return out }
+
+        // 진단은 작게 — 보려는 건 구조지 해상도가 아니다
+        let long = 520
+        let aspect = Double(input.linear.width) / Double(max(input.linear.height, 1))
+        let dh = aspect >= 1 ? Int(Double(long) / aspect) : long
+        let dw = aspect >= 1 ? long : Int(Double(long) * aspect)
+
+        guard let guideTex = texture(dw, dh),
+              let raw = texture(dw, dh, format: .r32Float),
+              let rgba = texture(dw, dh, format: .rgba8Unorm),
+              let cocTex = texture(dw, dh, format: .r16Float) else { return out }
+
+        let region = settings.cropRegion
+        let originY = textureOriginIsBottom
+            ? (1 - Float(region.origin.y) - Float(region.height))
+            : Float(region.origin.y)
+        let upsample = UpsampleParams(
+            sigmaColor: 0.12,
+            scaleX: Float(region.width), scaleY: Float(region.height),
+            offsetX: Float(region.origin.x), offsetY: originY,
+            rotation: Float(settings.depthRotation),
+            mirror: settings.depthMirror ? 1 : 0)
+        let scale = Float(input.linear.width) / Float(dw)
+
+        do {
+            let command = try newCommand()
+            try run("downsample_box", command, textures: [input.linear, guideTex],
+                    params: scale, size: (dw, dh))
+            try run("depth_upsample", command, textures: [guideTex, depth, raw],
+                    params: upsample, size: (dw, dh))
+            finish(command)
+
+            let lo = log2(max(out.nearDepth, 0.05))
+            let hi = log2(max(out.farDepth, out.nearDepth + 0.5))
+            let debug = DebugParams(lo: lo, hi: hi)
+            do {
+                let command = try newCommand()
+                try run("debug_depth", command, textures: [raw, rgba],
+                        params: debug, size: (dw, dh))
+                finish(command)
+                out.depthRaw = makeCGImage(rgba, flip: outputNeedsFlip)
+            }
+
+            guard let filled = try fillDepthHoles(raw) else { return out }
+            do {
+                let command = try newCommand()
+                try run("debug_depth", command, textures: [filled, rgba],
+                        params: debug, size: (dw, dh))
+                finish(command)
+                out.depthFilled = makeCGImage(rgba, flip: outputNeedsFlip)
+            }
+
+            let smallW = max(Int(Double(out.bokehSide) * min(aspect, 1)), 64)
+            out.maxRadius = min(Renderer.maxCoCPixels(settings: settings,
+                                                      focus: input.focusDistance,
+                                                      focalLength: focal,
+                                                      imageWidth: Float(smallW)), 220)
+            out.nearLimit = max(6, Float(input.linear.width) / Float(max(smallW, 1)) * 5)
+
+            let cocParams = CoCParams(
+                focusDistance: input.focusDistance,
+                focalLength: focal,
+                fNumber: settings.fNumber,
+                sensorWidth: 36,
+                imageWidth: Float(smallW),
+                maxCoC: 220,
+                scale: settings.bokehScale)
+            let command2 = try newCommand()
+            try run("coc_from_depth", command2, textures: [filled, cocTex],
+                    params: cocParams, size: (dw, dh))
+            try run("debug_coc", command2, textures: [cocTex, rgba],
+                    params: DebugParams(lo: 0, hi: max(out.maxRadius, 1)), size: (dw, dh))
+            finish(command2)
+            out.coc = makeCGImage(rgba, flip: outputNeedsFlip)
+
+            if let matte = input.matte {
+                let command3 = try newCommand()
+                try run("debug_gray", command3, textures: [matte, rgba], size: (dw, dh))
+                finish(command3)
+                out.matte = makeCGImage(rgba, flip: outputNeedsFlip)
+            }
+        } catch {
+            return out
+        }
+        return out
+    }
 
     /// LiDAR 가 못 읽은 구멍을 push-pull 피라미드로 메운다.
     /// 유효한 값만 모아 올리고(pull), 내려오면서 구멍만 채운다(push).

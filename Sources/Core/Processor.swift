@@ -242,10 +242,29 @@ final class Processor: ObservableObject {
     }
 
     /// ISO 에 따른 자동 노이즈 제거 하한. 사용자가 더 높게 잡으면 그 값을 쓴다.
+    ///
+    /// 예전 곡선은 실내 ISO1600 에서 0.39 까지 올라가서, 보케가 걸리기도 전에
+    /// 원본이 물러졌다. 노이즈보다 디테일이 아깝다 — 훨씬 완만하게 간다.
     nonisolated static func autoNoise(iso: Float) -> Float {
-        guard iso > 0 else { return 0.08 }
+        guard iso > 0 else { return 0.05 }
         let stops = log2(max(iso, 50) / 100)          // ISO100 기준 스톱 수
-        return min(max(0.05 + stops * 0.085, 0.05), 0.62)
+        return min(max(0.03 + stops * 0.05, 0.03), 0.42)
+    }
+
+    /// 초점면 고르기: 편집에서 탭한 지점 → 촬영 당시 LiDAR 중앙 → 깊이 중앙값 → 2m.
+    /// 확대해서 봤으면 탭 좌표를 원본 프레임 좌표로 되돌린다.
+    nonisolated static func focusDistance(settings: DevelopSettings, shot: Shot,
+                                          depth: DepthMap?) -> Float {
+        var focus: Float = 0
+        if let depth, settings.focusX >= 0, settings.focusY >= 0 {
+            let region = settings.cropRegion
+            let fx = Float(region.origin.x) + settings.focusX * Float(region.width)
+            let fy = Float(region.origin.y) + settings.focusY * Float(region.height)
+            focus = depth.distance(atX: fx, y: fy)
+        }
+        if focus <= 0.02 { focus = shot.focusDistance }
+        if focus <= 0.02, let depth { focus = depth.centerDistance() }
+        return focus > 0.02 ? focus : 2.0
     }
 
     /// 선형 장면값 기준 노이즈 바닥 추정. 신경망 블록의 셰이프 임계가 된다.
@@ -346,12 +365,11 @@ final class Processor: ObservableObject {
             let mw = max(Int(Double(width) * k), 64), mh = max(Int(Double(height) * k), 64)
             matteTexture = renderer?.grayTexture(matteImage, width: mw, height: mh)
         }
-        var focus = shot.focusDistance
-        if focus <= 0.02, let depth { focus = depth.centerDistance() }
-        if focus <= 0.02 { focus = 2.0 }
+        let focus = Processor.focusDistance(settings: settings, shot: shot, depth: depth)
 
         var input = Renderer.Input(linear: linear, depth: depthTexture, matte: matteTexture,
                                    focusDistance: focus)
+        input.depthMap = depth
         // 장면 분석 — 사진마다 노출·블랙·화이트를 따로 잡는다
         publish("analyze", 0)
         input.auto = analyze ? (renderer?.analyze(linear) ?? .neutral) : .neutral
@@ -455,8 +473,33 @@ final class Processor: ObservableObject {
                                                  targetLongSide: longSide, needsMatte: wantsMatte)
                         self.cache.store(key, input!)
                     }
-                    let result = try renderer.develop(input!, settings, recipe: light)
+                    // 초점 지점만 바뀐 경우엔 RAW 를 다시 디코드하지 않고 거리만 다시 잰다
+                    var ready = input!
+                    ready.focusDistance = Processor.focusDistance(settings: settings, shot: shot,
+                                                                  depth: ready.depthMap)
+                    let result = try renderer.develop(ready, settings, recipe: light)
                     continuation.resume(returning: renderer.cgImage(from: result))
+                } catch {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// 편집 화면의 진단 — 깊이·착란원·마스크를 그림으로 뽑아 온다
+    func diagnose(shot: Shot, settings: DevelopSettings) async -> Renderer.Diagnostics? {
+        guard let renderer, let paths = paths(for: shot, useExportAsSource: true) else { return nil }
+        let light = previewRecipe
+        return await withCheckedContinuation { continuation in
+            work.async {
+                do {
+                    let input = try self.prepare(shot: shot, settings: settings, paths: paths,
+                                                 recipe: light, targetLongSide: 1400,
+                                                 needsMatte: light.subjectMask)
+                    var ready = input
+                    ready.focusDistance = Processor.focusDistance(settings: settings, shot: shot,
+                                                                  depth: ready.depthMap)
+                    continuation.resume(returning: renderer.diagnose(ready, settings, recipe: light))
                 } catch {
                     continuation.resume(returning: nil)
                 }

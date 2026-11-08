@@ -143,6 +143,46 @@ struct DepthMap {
         return DepthMap(width: height, height: width, values: out)
     }
 
+    /// 화면의 한 점(정규화, y 는 위에서부터) 주변의 유효 깊이 중앙값.
+    /// 편집 화면에서 탭한 곳에 초점을 맞추는 데 쓴다.
+    func distance(atX nx: Float, y ny: Float) -> Float {
+        let cx = Int(min(max(nx, 0), 1) * Float(width - 1))
+        let cy = Int(min(max(ny, 0), 1) * Float(height - 1))
+        let span = max(min(width, height) / 28, 3)
+        var samples: [Float] = []
+        samples.reserveCapacity((span * 2 + 1) * (span * 2 + 1))
+        for y in max(cy - span, 0)...min(cy + span, height - 1) {
+            for x in max(cx - span, 0)...min(cx + span, width - 1) {
+                let v = values[y * width + x]
+                if v > 0.05, v < 60 { samples.append(v) }
+            }
+        }
+        guard !samples.isEmpty else { return 0 }
+        samples.sort()
+        return samples[samples.count / 2]
+    }
+
+    /// 유효 깊이 비율과 범위 — 진단 화면용
+    func stats() -> (valid: Float, near: Float, far: Float) {
+        var valid = 0
+        var near: Float = .greatestFiniteMagnitude
+        var far: Float = 0
+        let step = max(min(width, height) / 96, 1)
+        var total = 0
+        for y in stride(from: 0, to: height, by: step) {
+            for x in stride(from: 0, to: width, by: step) {
+                total += 1
+                let v = values[y * width + x]
+                guard v > 0.05, v < 60 else { continue }
+                valid += 1
+                near = min(near, v)
+                far = max(far, v)
+            }
+        }
+        guard total > 0, valid > 0 else { return (0, 0, 0) }
+        return (Float(valid) / Float(total), near, far)
+    }
+
     /// 중앙 영역의 유효 깊이 중앙값 — 자동 초점면 추정
     func centerDistance() -> Float {
         let x0 = width / 3, x1 = width * 2 / 3

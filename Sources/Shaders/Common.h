@@ -106,9 +106,21 @@ struct UpsampleParams {
 /// 흐린 층을 선명한 원본 위에 올릴 때
 struct CompositeParams {
     float upscale;        // 출력/작업 해상도 비. 1 이면 보정 안 함
+    float nearLimit;      // 이 착란원(px)까지는 풀해상도에서 직접 흐린다
+    float blades;
+    float curvature;
+    float rotation;
     float _pad0;
     float _pad1;
     float _pad2;
+};
+
+/// 진단 시각화
+struct DebugParams {
+    float lo;
+    float hi;
+    float mode;
+    float _pad0;
 };
 
 struct FinishParams {

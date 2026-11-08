@@ -19,6 +19,8 @@ struct EditorView: View {
     @State private var renderTask: Task<Void, Never>?
     @State private var loaded = false
     @State private var showDevelop = false
+    @State private var showDiagnostic = false
+    @State private var focusMarker: CGPoint?
 
     private var isDemo: Bool { ProcessInfo.processInfo.arguments.contains("-demo") }
     private var changed: Bool { settings != original }
@@ -35,6 +37,12 @@ struct EditorView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("닫기") { save(); dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showDiagnostic = true } label: {
+                        Image(systemName: "stethoscope")
+                    }
+                    .disabled(!store.hasRaw(shot))
                 }
                 ToolbarItem(placement: .principal) {
                     Button { showInfo = true } label: {
@@ -62,6 +70,9 @@ struct EditorView: View {
             .sheet(isPresented: $showDevelop) {
                 DevelopView(shots: [store.shots.first(where: { $0.id == shot.id }) ?? shot])
             }
+            .sheet(isPresented: $showDiagnostic) {
+                DiagnosticView(shot: shot, settings: settings)
+            }
         }
         .onAppear(perform: load)
         .onDisappear { renderTask?.cancel(); save() }
@@ -70,6 +81,31 @@ struct EditorView: View {
     // MARK: - 이미지
 
     private var imageArea: some View {
+        GeometryReader { geo in
+            ZStack {
+                imageContent
+                if let marker = focusMarker {
+                    Circle()
+                        .stroke(.yellow, lineWidth: 2)
+                        .frame(width: 54, height: 54)
+                        .position(marker)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .contentShape(Rectangle())
+            .onTapGesture { point in
+                setFocus(at: point, in: geo.size)
+            }
+            .onLongPressGesture(minimumDuration: 0.08, maximumDistance: 40) {
+            } onPressingChanged: { pressing in
+                showOriginal = pressing
+                if !pressing { scheduleRender() } else { renderOriginal() }
+            }
+        }
+    }
+
+    private var imageContent: some View {
         ZStack {
             Color.black
             if let image = displayImage {
@@ -104,12 +140,25 @@ struct EditorView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .onLongPressGesture(minimumDuration: 0.08, maximumDistance: 40) {
-        } onPressingChanged: { pressing in
-            showOriginal = pressing
-            if !pressing { scheduleRender() } else { renderOriginal() }
-        }
+    }
+
+    /// 탭한 곳에 초점을 잡는다. 화면 좌표를 '사진 안의 정규화 좌표'로 바꿔야 해서
+    /// scaledToFit 으로 들어간 실제 그림 영역을 다시 계산한다.
+    private func setFocus(at point: CGPoint, in size: CGSize) {
+        guard shot.hasDepth, settings.bokehEnabled else { return }
+        guard let image = displayImage, image.size.width > 0, image.size.height > 0 else { return }
+        let scale = min(size.width / image.size.width, size.height / image.size.height)
+        let drawn = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let originX = (size.width - drawn.width) / 2
+        let originY = (size.height - drawn.height) / 2
+        let nx = (point.x - originX) / drawn.width
+        let ny = (point.y - originY) / drawn.height
+        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return }
+        settings.focusX = Float(nx)
+        settings.focusY = Float(ny)
+        settings.focusDistance = 0          // 탭한 지점이 수동 거리보다 우선
+        focusMarker = point
+        scheduleRender()
     }
 
     private var displayImage: UIImage? {
@@ -143,6 +192,8 @@ struct EditorView: View {
                     Button {
                         var next = preset.settings
                         next.focusDistance = settings.focusDistance
+                        next.focusX = settings.focusX
+                        next.focusY = settings.focusY
                         settings = next
                         scheduleRender()
                     } label: {
@@ -177,6 +228,8 @@ struct EditorView: View {
     private func matches(_ other: DevelopSettings) -> Bool {
         var a = settings, b = other
         a.focusDistance = 0; b.focusDistance = 0
+        a.focusX = -1; b.focusX = -1
+        a.focusY = -1; b.focusY = -1
         return a == b
     }
 
@@ -217,6 +270,12 @@ struct EditorView: View {
 
                     if settings.bokehEnabled && shot.hasDepth {
                         BokehInfoRow(settings: settings, shot: shot)
+
+                            Text("사진을 탭하면 그 자리에 초점을 잡아요.")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow.opacity(0.75))
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 2)
 
                         Toggle(isOn: Binding(get: { settings.autoFocalLength },
                                              set: { settings.autoFocalLength = $0; scheduleRender() })) {

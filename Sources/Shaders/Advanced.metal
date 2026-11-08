@@ -738,6 +738,61 @@ kernel void linear_blur_v(texture2d<float, access::sample> src [[texture(0)]],
 }
 
 // ---------------------------------------------------------------------------
+//  7.5 진단 시각화 — 추리하지 않고 눈으로 본다
+// ---------------------------------------------------------------------------
+
+/// 깊이맵: 가까우면 흰색, 멀면 검정, 못 읽은 곳은 빨강
+kernel void debug_depth(texture2d<float, access::read>  src [[texture(0)]],
+                        texture2d<float, access::write> dst [[texture(1)]],
+                        constant DebugParams& P              [[buffer(0)]],
+                        uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float d = src.read(gid).r;
+    if (d <= 0.05f || d >= 300.0f) {
+        dst.write(float4(0.95f, 0.15f, 0.15f, 1), gid);   // 구멍 = 빨강
+        return;
+    }
+    // 로그 스케일이라야 가까운 쪽 차이가 보인다
+    float t = saturate((log2(max(d, 1e-3f)) - P.lo) / max(P.hi - P.lo, 1e-3f));
+    float v = 1.0f - t;
+    dst.write(float4(v, v, v, 1), gid);
+}
+
+/// 착란원: 전경 흐림은 빨강, 배경 흐림은 파랑, 초점 맞은 곳은 초록
+kernel void debug_coc(texture2d<float, access::read>  src [[texture(0)]],
+                      texture2d<float, access::write> dst [[texture(1)]],
+                      constant DebugParams& P              [[buffer(0)]],
+                      uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float c = src.read(gid).r;
+    float mag = saturate(abs(c) / max(P.hi, 1e-3f));
+    float3 color;
+    if (abs(c) < 1.0f) {
+        color = float3(0.1f, 0.95f, 0.3f);                 // 초점 = 초록
+    } else if (c < 0.0f) {
+        color = float3(0.25f + 0.75f * mag, 0.1f, 0.1f);   // 전경 = 빨강
+    } else {
+        color = float3(0.1f, 0.25f, 0.35f + 0.65f * mag);  // 배경 = 파랑
+    }
+    dst.write(float4(color, 1), gid);
+}
+
+/// 단일 채널(매트 등)을 흑백으로
+kernel void debug_gray(texture2d<float, access::sample> src [[texture(0)]],
+                       texture2d<float, access::write>  dst [[texture(1)]],
+                       uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float v = saturate(src.sample(kLinear, (float2(gid) + 0.5f) / float2(w, h)).r);
+    dst.write(float4(v, v, v, 1), gid);
+}
+
+// ---------------------------------------------------------------------------
 //  8. GPU 성능 측정용 더미 부하 (센서 테스터)
 //     현상에서 가장 무거운 연산(텍스처 샘플 + 초월함수)을 같은 비율로 돌린다.
 // ---------------------------------------------------------------------------

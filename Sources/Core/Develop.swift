@@ -48,8 +48,12 @@ struct DevelopSettings: Codable, Equatable {
     var bokehEnabled = true
     /// 시뮬레이션할 조리개값. 네 FE 50mm F1.8 기준 1.8 ... 16
     var fNumber: Float = 1.8
-    /// 초점 거리(m). 0 이면 촬영 시 LiDAR 초점 거리 사용
+    /// 초점 거리(m). 0 이면 초점 지점(또는 촬영 시 LiDAR 거리)을 쓴다
     var focusDistance: Float = 0
+    /// 편집 화면에서 탭해서 고른 초점 지점 (정규화, y 는 위에서부터).
+    /// 음수면 안 골랐다는 뜻이고 그때만 촬영 당시 중앙 거리를 쓴다.
+    var focusX: Float = -1
+    var focusY: Float = -1
     /// 화각 자동 인식 — EXIF 의 35mm 환산 초점거리 × 확대 배율을 쓴다.
     /// 아이폰 광각은 24mm 인데 50mm 로 가정하고 흐림을 계산하면 원근(넓은 화각)과
     /// 흐림(망원)이 따로 놀아서 가짜처럼 보인다. 이걸 끄면 focalLength 를 쓴다.
@@ -157,6 +161,8 @@ struct DevelopSettings: Codable, Equatable {
         bokehEnabled = b(.bokehEnabled, bokehEnabled)
         fNumber = f(.fNumber, fNumber)
         focusDistance = f(.focusDistance, focusDistance)
+        focusX = f(.focusX, focusX)
+        focusY = f(.focusY, focusY)
         autoFocalLength = b(.autoFocalLength, autoFocalLength)
         focalLength = f(.focalLength, focalLength)
         zoom = f(.zoom, zoom)
