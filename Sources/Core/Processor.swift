@@ -379,6 +379,7 @@ final class Processor: ObservableObject {
         // 센서를 잘라 찍었으면 그만큼 망원으로 찍은 것과 같다.
         let base = shot.focalLength35 > 1 ? shot.focalLength35 : 24
         input.capturedFocal = base * max(shot.captureZoom, 1)
+        input.farDistance = depth?.assumedFarDistance() ?? 60
         publish("analyze", 1)
         return input
     }

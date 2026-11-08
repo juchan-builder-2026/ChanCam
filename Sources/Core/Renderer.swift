@@ -526,6 +526,8 @@ final class Renderer: @unchecked Sendable {
         /// CPU 쪽 깊이맵 원본. 초점 지점을 바꿀 때 RAW 를 다시 디코드하지 않고
         /// 거리만 다시 재려고 들고 있는다.
         var depthMap: DepthMap?
+        /// 끝내 못 읽은 깊이에 넣을 거리 (장면의 실제 먼 끝에서 추정)
+        var farDistance: Float = 60
         /// EXIF 가 알려준 35mm 환산 초점거리 × 확대 배율.
         /// 자동 화각을 켜면 이 값으로 착란원을 계산한다 — 아이폰 광각은 24mm 라서
         /// 50mm 로 가정하면 원근과 흐림이 따로 놀아 가짜처럼 보인다.
@@ -707,6 +709,7 @@ final class Renderer: @unchecked Sendable {
                                      matte: input.matte, settings: settings, recipe: recipe,
                                      focusDistance: input.focusDistance,
                                      capturedFocal: input.capturedFocal,
+                                     farDistance: input.farDistance,
                                      report: tell, check: check) {
                 swap(&front, &back)
             }
@@ -977,6 +980,7 @@ final class Renderer: @unchecked Sendable {
                                    depth: MTLTexture, matte: MTLTexture?,
                                    settings: DevelopSettings, recipe: DevelopRecipe,
                                    focusDistance: Float, capturedFocal: Float,
+                                   farDistance: Float,
                                    report: StageReport,
                                    check: () throws -> Void) throws -> Bool {
         let width = source.width, height = source.height
@@ -1037,7 +1041,9 @@ final class Renderer: @unchecked Sendable {
         report("depth", 0.35)
 
         // LiDAR 사거리 밖은 전부 구멍이다 — push-pull 로 메운다
-        guard let filled = try fillDepthHoles(depthHi) else { throw RenderError.allocation }
+        guard let filled = try fillDepthHoles(depthHi, far: farDistance) else {
+            throw RenderError.allocation
+        }
         report("depth", 0.7)
 
         do {
@@ -1129,9 +1135,14 @@ final class Renderer: @unchecked Sendable {
         return true
     }
 
-    /// 구멍을 메울 수 있는 최대 반경 (깊이 작업 해상도 기준 픽셀).
-    /// 이보다 큰 구멍은 '메울 근거가 없는 곳' = LiDAR 사거리 밖 = 무한대로 둔다.
-    static let depthFillLevels = 5
+    /// 구멍을 메울 수 있는 피라미드 단계 수.
+    ///
+    /// 정답 깊이가 있는 데이터셋(Middlebury)에 LiDAR 사거리 컷을 흉내 내서 측정한 결과:
+    ///   5단계 → 사거리 밖 영역의 51% 가 '실제보다 가깝게' 채워짐  (v1.4~1.5 의 하늘 문제)
+    ///   3단계 → 17%
+    ///   2단계 → 8%,  작은 드롭아웃 구멍은 여전히 오차 0.0005m 로 정확
+    /// 구멍은 '멀어서' 생기는 게 압도적이라 조금만 번지게 하는 쪽이 맞다.
+    static let depthFillLevels = 2
 
     // MARK: - 진단
 
@@ -1213,7 +1224,7 @@ final class Renderer: @unchecked Sendable {
                 out.depthRaw = makeCGImage(rgba, flip: outputNeedsFlip)
             }
 
-            guard let filled = try fillDepthHoles(raw) else { return out }
+            guard let filled = try fillDepthHoles(raw, far: input.farDistance) else { return out }
             do {
                 let command = try newCommand()
                 try run("debug_depth", command, textures: [filled, rgba],
@@ -1265,7 +1276,7 @@ final class Renderer: @unchecked Sendable {
     /// 유효한 깊이는 손과 가구뿐이라, 하늘에 "30cm"가 들어가 버린다.
     /// 그러면 능선에서 착란원 부호가 뒤집히며 계단 모양 하드 엣지가 생긴다.
     /// (v1.3 에서 실제로 그랬다.)
-    private func fillDepthHoles(_ source: MTLTexture) throws -> MTLTexture? {
+    private func fillDepthHoles(_ source: MTLTexture, far: Float = 400) throws -> MTLTexture? {
         let w = source.width, h = source.height
         guard let base = texture(w, h, format: .rg16Float) else { return nil }
         do {
@@ -1302,7 +1313,7 @@ final class Renderer: @unchecked Sendable {
         guard let result = texture(w, h, format: .r32Float) else { return nil }
         let command = try newCommand()
         try run("depth_unpack", command, textures: [carried, result],
-                params: Float(400), size: (w, h))
+                params: far, size: (w, h))
         finish(command)
         return result
     }

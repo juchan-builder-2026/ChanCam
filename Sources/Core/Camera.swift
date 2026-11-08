@@ -300,13 +300,12 @@ final class Camera: NSObject, ObservableObject {
             caps.depthHeight = Int(d.height)
         }
 
-        // 확대 가능 범위 — 망원이 고장난 기기를 위해 렌즈 전환 지점 앞에서 멈춘다
+        // 확대 가능 범위 — 깊이 포맷까지 반영한 실제 상한을 읽는다
+        let stayMain = UserDefaults.standard.object(forKey: "stayOnMainLens") as? Bool ?? true
+        let ceiling = Camera.zoomCeiling(device, stayOnMain: stayMain)
         let switchPoints = device.virtualDeviceSwitchOverVideoZoomFactors
             .map { CGFloat(truncating: $0) }
-            .filter { $0 > 1 }
-        var ceiling = min(device.activeFormat.videoMaxZoomFactor, 12)
-        let stayMain = UserDefaults.standard.object(forKey: "stayOnMainLens") as? Bool ?? true
-        if stayMain, let first = switchPoints.min() { ceiling = min(ceiling, first - 0.01) }
+            .filter { $0 > 1.001 }
         let currentZoom = device.videoZoomFactor
 
         Task { @MainActor in
@@ -360,45 +359,83 @@ final class Camera: NSObject, ObservableObject {
         }
     }
 
-    /// 메인 센서를 잘라 확대한다 (디지털 줌).
+    /// 이 기기·이 포맷에서 실제로 가능한 확대 상한.
     ///
-    /// 멀티 카메라 장치에서는 배율이 일정 지점을 넘으면 iOS 가 망원으로 넘어가는데,
-    /// 망원이 고장난 기기에서는 그게 재앙이다. `stayOnMainLens` 가 켜져 있으면
-    /// 그 지점 직전까지만 올라간다.
+    /// `activeFormat.videoMaxZoomFactor` 를 보면 안 된다 — 그건 포맷의 이론값이라
+    /// 깊이 포맷을 켜 두면 실제 한계와 다르다. 실시간 제약까지 반영하는 건
+    /// `maxAvailableVideoZoomFactor` 쪽이다. (v1.4 에서 확대 버튼이 먹통이던 이유)
+    nonisolated private static func zoomCeiling(_ device: AVCaptureDevice,
+                                                stayOnMain: Bool) -> CGFloat {
+        var ceiling = min(device.maxAvailableVideoZoomFactor, 12)
+        // 렌즈가 실제로 바뀌는 건 광각/초광각/망원을 묶은 가상 장치뿐이다.
+        // LiDAR 카메라는 촬상 렌즈가 하나라서 해당 없다.
+        let multiLens: Set<AVCaptureDevice.DeviceType> = [
+            .builtInDualCamera, .builtInDualWideCamera, .builtInTripleCamera,
+        ]
+        if stayOnMain, multiLens.contains(device.deviceType) {
+            let points = device.virtualDeviceSwitchOverVideoZoomFactors
+                .map { CGFloat(truncating: $0) }
+                .filter { $0 > 1.001 }
+            if let first = points.min() { ceiling = min(ceiling, first - 0.01) }
+        }
+        return max(ceiling, device.minAvailableVideoZoomFactor)
+    }
+
+    /// 메인 센서를 잘라 확대한다 (디지털 줌).
     func setZoom(_ factor: CGFloat) {
-        let requested = max(factor, 1)
         sessionQueue.async { [weak self] in
             guard let self, let device = self.device else { return }
-            var ceiling = min(device.activeFormat.videoMaxZoomFactor, 12)
-            let switchPoints = device.virtualDeviceSwitchOverVideoZoomFactors
-                .map { CGFloat(truncating: $0) }
-                .filter { $0 > 1 }
-            if self.stayOnMainLens, let first = switchPoints.min() {
-                ceiling = min(ceiling, first - 0.01)
-            }
-            let clamped = min(max(requested, 1), max(ceiling, 1))
+            let stay = self.stayOnMainLens
+            let ceiling = Camera.zoomCeiling(device, stayOnMain: stay)
+            let floor = device.minAvailableVideoZoomFactor
+            let clamped = min(max(factor, floor), ceiling)
+            var applied = device.videoZoomFactor
+            var failure: String?
             do {
                 try device.lockForConfiguration()
                 device.videoZoomFactor = clamped
+                applied = device.videoZoomFactor
                 device.unlockForConfiguration()
             } catch {
-                return
+                failure = "확대 실패 — \(error.localizedDescription)"
             }
+            let switchPoint = device.virtualDeviceSwitchOverVideoZoomFactors
+                .map { CGFloat(truncating: $0) }.filter { $0 > 1.001 }.min() ?? 0
             Task { @MainActor in
-                self.zoom = clamped
-                self.maxZoom = max(ceiling, 1)
-                self.lensSwitchZoom = switchPoints.min() ?? 0
+                self.zoom = applied
+                self.maxZoom = ceiling
+                self.lensSwitchZoom = switchPoint
+                if let failure { self.lastError = failure }
             }
         }
     }
 
-    /// 확대 단계 버튼에 쓸 값들 — 기기가 실제로 낼 수 있는 범위 안에서만
+    /// 확대 단계 버튼 — 기기가 실제로 낼 수 있는 값만 보여준다.
+    /// 상한이 1.0 이면 (확대 불가) 버튼을 아예 안 띄운다.
     var zoomStops: [CGFloat] {
-        let candidates: [CGFloat] = [1, 1.5, 2, 3, 5, 8]
-        let limit = maxZoom > 1 ? maxZoom : 2
-        var stops = candidates.filter { $0 <= limit + 0.001 }
-        if stops.isEmpty { stops = [1] }
+        guard maxZoom > 1.05 else { return [] }
+        var stops: [CGFloat] = [1]
+        for candidate in [1.5, 2, 3, 5, 8] as [CGFloat] where candidate <= maxZoom + 0.001 {
+            stops.append(candidate)
+        }
+        // 상한이 어중간하면 (예: 2.4×) 끝값을 하나 더 붙여 준다
+        if let last = stops.last, maxZoom - last > 0.25 {
+            stops.append((maxZoom * 10).rounded(.down) / 10)
+        }
         return stops
+    }
+
+    var zoomNote: String {
+        guard let device else { return "카메라 준비 중" }
+        if maxZoom <= 1.05 {
+            return "이 포맷에서는 확대가 안 돼요 (깊이 스트림과 48MP를 같이 쓰는 중)"
+        }
+        var text = String(format: "1.0× – %.1f×", maxZoom)
+        if lensSwitchZoom > 1.001 {
+            text += String(format: " · 렌즈 전환 %.1f×", lensSwitchZoom)
+        }
+        _ = device
+        return text
     }
 
     func setExposureBias(_ ev: Float) {

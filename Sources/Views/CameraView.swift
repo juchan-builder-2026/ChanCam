@@ -241,8 +241,24 @@ struct ZoomStrip: View {
     @Binding var pinchBase: CGFloat
 
     var body: some View {
+        let stops = camera.zoomStops
+        return Group {
+            if stops.isEmpty {
+                Text(camera.zoomNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(.black.opacity(0.4)))
+            } else {
+                buttons(stops)
+            }
+        }
+    }
+
+    private func buttons(_ stops: [CGFloat]) -> some View {
         HStack(spacing: 8) {
-            ForEach(camera.zoomStops, id: \.self) { stop in
+            ForEach(stops, id: \.self) { stop in
                 let selected = abs(camera.zoom - stop) < 0.06
                 Button {
                     camera.setZoom(stop)

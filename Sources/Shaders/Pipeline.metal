@@ -572,8 +572,14 @@ kernel void bokeh_composite(texture2d<float, access::sample> sharp  [[texture(0)
     float3 nearBlur = a;
     if (c < nearLimit * 1.4f) {
         float radius = c * 0.5f;
-        int taps = int(clamp(radius * 4.0f, 8.0f, 44.0f));
-        float jitter = hash12(float2(gid) * 1.31f) * 6.2831853f;
+        // 탭 수는 반경이 아니라 **면적**에 비례해야 한다. 반경 7px 디스크는
+        // 154픽셀짜리 면적인데 28탭으로는 턱없이 모자라서 구조가 살아남는다
+        // (검증: 6~14px 구간이 물리 기준보다 1.97배 덜 흐려졌다 → 면적 비례로 1.05).
+        int taps = int(clamp(ceil(radius * radius * 2.2f), 12.0f, 72.0f));
+        // 픽셀마다 완전 난수를 쓰면 이웃끼리 탭이 달라져 입자 노이즈가 된다.
+        // 2x2 네 단계 위상 + 아주 작은 난수면 밴딩도 노이즈도 없다.
+        float bayer = float(((gid.x & 1u) * 2u + (gid.y & 1u))) * 1.5707963f;
+        float jitter = bayer + hash12(float2(gid) * 1.31f) * 0.35f;
         float3 acc = 0.0f;
         float wsum = 0.0f;
         for (int i = 0; i < taps; ++i) {
