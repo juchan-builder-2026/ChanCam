@@ -138,13 +138,21 @@ struct DiagnosticView: View {
         return lines.joined(separator: "\n\n")
     }
 
+    private func tint(_ good: Bool?) -> Color {
+        switch good {
+        case .some(true): return .green
+        case .some(false): return .orange
+        case nil: return .primary
+        }
+    }
+
     private func row(_ title: String, _ value: String, good: Bool? = nil) -> some View {
         HStack {
             Text(title).foregroundStyle(.secondary)
             Spacer()
             Text(value)
                 .monospacedDigit()
-                .foregroundStyle(good == nil ? .primary : (good! ? .green : .orange))
+                .foregroundStyle(tint(good))
         }
         .font(.subheadline)
     }
