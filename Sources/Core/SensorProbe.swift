@@ -132,20 +132,34 @@ struct SensorProbe {
 
     private static func cameraGroup(_ device: AVCaptureDevice) -> Group {
         let depthFormats = device.formats.filter { !$0.supportedDepthDataFormats.isEmpty }
-        let maxPhoto = device.formats
-            .flatMap(\.supportedMaxPhotoDimensions)
-            .max { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
-        let bestDepth = depthFormats
-            .flatMap(\.supportedDepthDataFormats)
-            .map { CMVideoFormatDescriptionGetDimensions($0.formatDescription) }
-            .max { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
+        var maxPhoto: CMVideoDimensions?
+        for format in device.formats {
+            for dim in format.supportedMaxPhotoDimensions {
+                let area = Int(dim.width) * Int(dim.height)
+                let bestArea = maxPhoto.map { Int($0.width) * Int($0.height) } ?? -1
+                if area > bestArea { maxPhoto = dim }
+            }
+        }
+        // 한 줄로 쓰면 타입 체커가 터진다 — 단계를 쪼개 둔다
+        var depthDims: [CMVideoDimensions] = []
+        for format in depthFormats {
+            for candidate in format.supportedDepthDataFormats {
+                depthDims.append(CMVideoFormatDescriptionGetDimensions(candidate.formatDescription))
+            }
+        }
+        var bestDepth: CMVideoDimensions?
+        for dim in depthDims {
+            let area = Int(dim.width) * Int(dim.height)
+            let bestArea = bestDepth.map { Int($0.width) * Int($0.height) } ?? -1
+            if area > bestArea { bestDepth = dim }
+        }
 
         var rows: [Row] = []
         if let maxPhoto {
-            let mp = Double(maxPhoto.width) * Double(maxPhoto.height) / 1_000_000
-            rows.append(Row(title: "최대 사진",
-                            value: String(format: "%.0fMP · %d×%d", mp.rounded(.down),
-                                          maxPhoto.width, maxPhoto.height)))
+            let pixels = Double(Int(maxPhoto.width) * Int(maxPhoto.height))
+            let mp = (pixels / 1_000_000).rounded(.down)
+            let text = String(format: "%.0fMP", mp) + " · \(maxPhoto.width)×\(maxPhoto.height)"
+            rows.append(Row(title: "최대 사진", value: text))
         }
         rows.append(Row(title: "포맷 수", value: "\(device.formats.count)개"))
         rows.append(Row(title: "깊이 지원 포맷", value: "\(depthFormats.count)개",
@@ -158,11 +172,11 @@ struct SensorProbe {
         }
 
         // 48MP 와 깊이를 동시에 가지는 포맷이 있는지 — v1.0 의 LiDAR 문제의 핵심
-        let bigAndDepth = device.formats.contains { format in
-            guard !format.supportedDepthDataFormats.isEmpty else { return false }
-            let best = format.supportedMaxPhotoDimensions
-                .map { Int($0.width) * Int($0.height) }.max() ?? 0
-            return best >= 40_000_000
+        var bigAndDepth = false
+        for format in device.formats where !format.supportedDepthDataFormats.isEmpty {
+            for dim in format.supportedMaxPhotoDimensions {
+                if Int(dim.width) * Int(dim.height) >= 40_000_000 { bigAndDepth = true }
+            }
         }
         rows.append(Row(title: "40MP↑ + 깊이 동시 포맷", value: bigAndDepth ? "있음" : "없음",
                         good: bigAndDepth))
@@ -170,22 +184,27 @@ struct SensorProbe {
         let active = device.activeFormat
         let activeDim = CMVideoFormatDescriptionGetDimensions(active.formatDescription)
         rows.append(Row(title: "현재 활성 포맷", value: "\(activeDim.width)×\(activeDim.height)"))
-        rows.append(Row(title: "ISO 범위",
-                        value: String(format: "%.0f – %.0f", active.minISO, active.maxISO)))
-        rows.append(Row(title: "셔터 범위",
-                        value: String(format: "%.0fs – 1/%.0f",
-                                      CMTimeGetSeconds(active.maxExposureDuration),
-                                      1 / max(CMTimeGetSeconds(active.minExposureDuration), 1e-6))))
-        rows.append(Row(title: "노출 보정 범위",
-                        value: String(format: "%+.1f – %+.1f EV",
-                                      device.minExposureTargetBias, device.maxExposureTargetBias)))
-        rows.append(Row(title: "최소 초점 거리",
-                        value: device.minimumFocusDistance > 0
-                            ? "\(device.minimumFocusDistance)mm" : "확인 불가"))
-        rows.append(Row(title: "광학 손떨림 보정",
-                        value: active.isVideoStabilizationModeSupported(.cinematicExtended)
-                            ? "시네마틱 확장" : (active.isVideoStabilizationModeSupported(.standard)
-                                             ? "표준" : "미지원")))
+        let isoText = String(format: "%.0f", active.minISO) + " – " + String(format: "%.0f", active.maxISO)
+        rows.append(Row(title: "ISO 범위", value: isoText))
+
+        let slowest: Double = CMTimeGetSeconds(active.maxExposureDuration)
+        let quickest: Double = CMTimeGetSeconds(active.minExposureDuration)
+        let fastest: Double = 1 / max(quickest, 1e-6)
+        let shutterText = String(format: "%.0fs", slowest) + " – 1/" + String(format: "%.0f", fastest)
+        rows.append(Row(title: "셔터 범위", value: shutterText))
+
+        let biasLow = String(format: "%+.1f", device.minExposureTargetBias)
+        let biasHigh = String(format: "%+.1f", device.maxExposureTargetBias)
+        rows.append(Row(title: "노출 보정 범위", value: biasLow + " – " + biasHigh + " EV"))
+
+        let focusMM: Int = device.minimumFocusDistance
+        rows.append(Row(title: "최소 초점 거리", value: focusMM > 0 ? "\(focusMM)mm" : "확인 불가"))
+
+        var stabilization = "미지원"
+        if active.isVideoStabilizationModeSupported(.cinematicExtended) { stabilization = "시네마틱 확장" }
+        else if active.isVideoStabilizationModeSupported(.standard) { stabilization = "표준" }
+        rows.append(Row(title: "광학 손떨림 보정", value: stabilization))
+
         rows.append(Row(title: "빈닝(픽셀 합치기) 포맷",
                         value: active.isVideoBinned ? "사용 중" : "사용 안 함"))
         rows.append(Row(title: "렌즈 조리개", value: String(format: "f/%.2f", device.lensAperture)))
@@ -218,13 +237,12 @@ struct SensorProbe {
                          note: "이 항목들은 세션을 실제로 구성한 뒤에만 의미가 있어요. 촬영 화면을 한 번 열고 다시 들어오세요.")
         }
         func mark(_ ok: Bool) -> String { ok ? "지원" : "미지원" }
+        let pixels = Double(caps.maxPhotoWidth * caps.maxPhotoHeight)
+        let mp = (pixels / 1_000_000).rounded(.down)
+        let sizeText = String(format: "%.0fMP", mp) + " · \(caps.maxPhotoWidth)×\(caps.maxPhotoHeight)"
         var rows: [Row] = [
             Row(title: "활성 카메라", value: caps.deviceName),
-            Row(title: "최대 사진",
-                value: String(format: "%.0fMP · %d×%d",
-                              (Double(caps.maxPhotoWidth) * Double(caps.maxPhotoHeight) / 1_000_000)
-                                  .rounded(.down),
-                              caps.maxPhotoWidth, caps.maxPhotoHeight)),
+            Row(title: "최대 사진", value: sizeText),
             Row(title: "Apple ProRAW", value: caps.proRAWEnabled ? "켜짐" : mark(caps.proRAW),
                 good: caps.proRAWEnabled),
             Row(title: "깊이 전달 (사진 출력)", value: mark(caps.depthDelivery)),

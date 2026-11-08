@@ -244,12 +244,8 @@ struct DevelopView: View {
                     }
                 }
             }
-            LabeledContent("중간 버퍼",
-                           value: SystemMonitor.text(UInt64(max(recipe.estimatedBytes, 0))))
-            LabeledContent("앱 메모리 한도",
-                           value: SystemMonitor.text(monitor.ramLimit > 0
-                                                     ? monitor.ramLimit
-                                                     : SystemMonitor.memoryLimit(current: SystemMonitor.footprint())))
+            LabeledContent("중간 버퍼", value: SystemMonitor.text(bufferBytes))
+            LabeledContent("앱 메모리 한도", value: SystemMonitor.text(memoryLimit))
             if memoryTight {
                 Label("이 해상도·등급은 메모리 한도에 가까워요. 48MP + 극한은 중간에 강제 종료될 수 있어요.",
                       systemImage: "exclamationmark.triangle.fill")
@@ -259,14 +255,27 @@ struct DevelopView: View {
         } header: {
             Text("예상")
         } footer: {
-            Text("예상 시간은 이 기기에서 실제로 측정한 GPU 처리량(\(processor.gpuScore > 0 ? String(format: "%.1f G탭/초", processor.gpuScore / 1e9) : "미측정"))으로 계산해요. 열이 오르면 느려지니 눈금으로만 보세요.")
+            Text("예상 시간은 이 기기에서 실제로 측정한 GPU 처리량(" + scoreText + ")으로 계산해요. 열이 오르면 느려지니 눈금으로만 보세요.")
         }
     }
 
+    private var scoreText: String {
+        let score = processor.gpuScore
+        guard score > 0 else { return "미측정" }
+        return String(format: "%.1f G탭/초", score / 1e9)
+    }
+
+    private var bufferBytes: UInt64 {
+        UInt64(max(recipe.estimatedBytes, 0))
+    }
+
+    private var memoryLimit: UInt64 {
+        if monitor.ramLimit > 0 { return monitor.ramLimit }
+        return SystemMonitor.memoryLimit(current: SystemMonitor.footprint())
+    }
+
     private var memoryTight: Bool {
-        let limit = monitor.ramLimit > 0
-            ? monitor.ramLimit
-            : SystemMonitor.memoryLimit(current: SystemMonitor.footprint())
+        let limit = memoryLimit
         guard limit > 0 else { return false }
         return Double(recipe.estimatedBytes) > Double(limit) * 0.62
     }
