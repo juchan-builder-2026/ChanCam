@@ -81,6 +81,19 @@ struct DepthMap {
         return DepthMap(width: w, height: h, values: values)
     }
 
+    /// 세로 사진에 맞춰 90° 시계방향 회전. 앱이 세로 전용이라
+    /// 깊이맵도 항상 세로로 맞춰두면 사진과 어긋날 일이 없다.
+    func rotatedToPortrait() -> DepthMap {
+        guard width > height else { return self }
+        var out = [Float](repeating: 0, count: width * height)
+        for y in 0..<width {                 // 새 높이 = 기존 너비
+            for x in 0..<height {            // 새 너비 = 기존 높이
+                out[y * height + x] = values[(height - 1 - x) * width + y]
+            }
+        }
+        return DepthMap(width: height, height: width, values: out)
+    }
+
     /// 중앙 영역의 유효 깊이 중앙값 — 자동 초점면 추정
     func centerDistance() -> Float {
         let x0 = width / 3, x1 = width * 2 / 3

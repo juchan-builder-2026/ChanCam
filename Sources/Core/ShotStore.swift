@@ -117,8 +117,9 @@ final class ShotStore: ObservableObject {
 
         // 깊이
         if let depth {
-            let converted = depth.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-            if let map = ShotStore.depthMap(from: converted.depthDataMap) {
+            let converted = depth.depthDataType == kCVPixelFormatType_DepthFloat32
+                ? depth : depth.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+            if let map = ShotStore.depthMap(from: converted.depthDataMap)?.rotatedToPortrait() {
                 try map.encoded().write(to: dir.appendingPathComponent("depth.bin"), options: .atomic)
                 shot.depthFile = "depth.bin"
                 shot.depthWidth = map.width

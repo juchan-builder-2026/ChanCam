@@ -17,7 +17,7 @@ constant sampler kNearest(coord::normalized, address::clamp_to_edge, filter::nea
 // ---------------------------------------------------------------------------
 
 struct ToneParams {
-    float exposure;       // EV
+    float exposure;       // EV (사용자 + 자동 분석)
     float contrast;       // -1 ... 1
     float highlights;     // -1 ... 1
     float shadows;        // -1 ... 1
@@ -28,7 +28,18 @@ struct ToneParams {
     float tempScaleR;     // 화이트밸런스 채널 게인
     float tempScaleG;
     float tempScaleB;
+    float wbLuma;         // 위 게인의 휘도 (마스크 보정용)
+    float white;          // 필름 숄더 백포인트 (선형). 장면 분석에서 나온다
+    float blackPoint;     // 선형 블랙 (베일링 플레어 제거). 장면 분석
+    float detailGain;     // 베이스를 압축한 만큼 디테일을 되살리는 양 (1.0 ~ 1.4)
     float _pad0;
+};
+
+struct BlurParams {
+    float radius;         // px
+    float sigmaStops;     // 바이래터럴 레인지 시그마 (스톱 단위). 0 이면 일반 가우시안
+    float _pad0;
+    float _pad1;
 };
 
 struct DetailParams {
@@ -229,10 +240,42 @@ kernel void coc_smooth(texture2d<float, access::read>  src [[texture(0)]],
 //     색 노이즈는 훨씬 세게 뭉개도 디테일이 안 죽는다.
 // ---------------------------------------------------------------------------
 
-kernel void denoise(texture2d<float, access::sample> src [[texture(0)]],
-                    texture2d<float, access::write>  dst [[texture(1)]],
-                    constant DetailParams& P             [[buffer(0)]],
-                    uint2 gid                            [[thread_position_in_grid]])
+//  컬러 노이즈는 저주파라 1/4 해상도에서 넓게 뭉개는 게 더 깨끗하고 16배 빠르다.
+//  여기서 작은 해상도의 색도판을 만든다.
+kernel void chroma_blur(texture2d<float, access::sample> src [[texture(0)]],  // 1/4 축소본
+                        texture2d<float, access::write>  dst [[texture(1)]],
+                        constant DetailParams& P             [[buffer(0)]],
+                        uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 size = float2(w, h);
+    float2 uv = (float2(gid) + 0.5f) / size;
+    float3 center = src.sample(kLinear, uv).rgb;
+    float centerL = max(luma(center), 1e-4f);
+
+    int r = 1 + int(clamp(P.colorNR, 0.0f, 1.0f) * 3.0f);   // 최대 7x7 @ 1/4 = 28x28 @ 풀
+    float3 acc = 0.0f;
+    float wsum = 0.0f;
+    for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+            float3 s = src.sample(kLinear, uv + float2(dx, dy) / size).rgb;
+            float sl = max(luma(s), 1e-4f);
+            // 밝기가 비슷한 이웃만 — 경계 너머로 색이 번지지 않게
+            float dl = log2(sl / centerL);
+            float wgt = exp(-0.5f * dl * dl / 0.36f);
+            acc += (s / sl) * wgt;      // 휘도를 뺀 순수 색도
+            wsum += wgt;
+        }
+    }
+    dst.write(float4(acc / max(wsum, 1e-5f), 1), gid);
+}
+
+kernel void denoise(texture2d<float, access::sample> src    [[texture(0)]],
+                    texture2d<float, access::sample> chroma [[texture(1)]],  // 1/4 색도판
+                    texture2d<float, access::write>  dst    [[texture(2)]],
+                    constant DetailParams& P                [[buffer(0)]],
+                    uint2 gid                               [[thread_position_in_grid]])
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
@@ -245,41 +288,36 @@ kernel void denoise(texture2d<float, access::sample> src [[texture(0)]],
         return;
     }
 
-    float centerL = luma(center);
-    float sigmaL = 0.012f + 0.14f * P.lumaNR;
-    float3 lumaAcc = 0.0f, chromaAcc = 0.0f;
-    float lumaW = 0.0f, chromaW = 0.0f;
-    int radius = (P.colorNR > 0.5f) ? 3 : 2;
+    float3 outC = center;
 
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            float2 suv = uv + float2(dx, dy) / size;
-            float3 s = src.sample(kLinear, suv).rgb;
-            float sl = luma(s);
-            float dist = float(dx * dx + dy * dy);
-            float spatial = exp(-dist / (2.0f * float(radius * radius)));
-
-            float dl = (sl - centerL) / sigmaL;
-            float wl = spatial * exp(-0.5f * dl * dl);
-            lumaAcc += s * wl;
-            lumaW += wl;
-
-            // 색도는 공간 가중치만 (경계 유지는 휘도가 담당)
-            float wc = spatial;
-            chromaAcc += s * wc;
-            chromaW += wc;
+    // 1) 휘도 노이즈 — 풀해상도 3x3 바이래터럴이면 충분하다 (디테일을 지킨다)
+    if (P.lumaNR > 0.01f) {
+        float centerL = luma(center);
+        float sigmaL = 0.010f + 0.12f * P.lumaNR;
+        float3 acc = 0.0f;
+        float wsum = 0.0f;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                float3 s = src.sample(kLinear, uv + float2(dx, dy) / size).rgb;
+                float dl = (luma(s) - centerL) / sigmaL;
+                float spatial = (dx == 0 && dy == 0) ? 1.0f : ((dx == 0 || dy == 0) ? 0.7f : 0.45f);
+                float wgt = spatial * exp(-0.5f * dl * dl);
+                acc += s * wgt;
+                wsum += wgt;
+            }
         }
+        outC = mix(center, acc / max(wsum, 1e-5f), clamp(P.lumaNR, 0.0f, 1.0f));
     }
 
-    float3 lumaFiltered = lumaAcc / max(lumaW, 1e-5f);
-    float3 chromaFiltered = chromaAcc / max(chromaW, 1e-5f);
+    // 2) 컬러 노이즈 — 작은 색도판을 가져와 현재 휘도에 입힌다
+    if (P.colorNR > 0.01f) {
+        float3 cs = chroma.sample(kLinear, uv).rgb;       // 휘도 1 로 정규화된 색도
+        float lp = max(luma(outC), 1e-5f);
+        float cl = max(luma(cs), 1e-4f);
+        float3 chromaPart = cs * (lp / cl);
+        outC = mix(outC, chromaPart, clamp(P.colorNR * 0.9f, 0.0f, 1.0f));
+    }
 
-    // 휘도는 원본 대비 약하게, 색도는 세게 섞는다
-    float3 lumaPart = mix(center, lumaFiltered, clamp(P.lumaNR, 0.0f, 1.0f));
-    float lp = luma(lumaPart);
-    float cf = luma(chromaFiltered);
-    float3 chromaPart = chromaFiltered * (lp / max(cf, 1e-4f));
-    float3 outC = mix(lumaPart, chromaPart, clamp(P.colorNR * 0.85f, 0.0f, 1.0f));
     dst.write(float4(max(outC, 0.0f), 1), gid);
 }
 
@@ -287,42 +325,56 @@ kernel void denoise(texture2d<float, access::sample> src [[texture(0)]],
 //  4. 로컬 톤 마스크용 휘도 블러 (하이라이트/섀도우가 로컬로 동작하게)
 // ---------------------------------------------------------------------------
 
+//  입력·출력 모두 '로그2 휘도' 다. 레인지 가중치를 쓰는 바이래터럴이라
+//  경계를 넘어 번지지 않는다 → 섀도우를 크게 올려도 할로가 안 생긴다.
+
+inline float bilateralLine(texture2d<float, access::sample> src, float2 uv, float2 step,
+                           int r, float sigmaS2, float sigmaR)
+{
+    float center = src.sample(kNearest, uv).r;
+    float acc = center, wsum = 1.0f;
+    float invR2 = (sigmaR > 1e-4f) ? (1.0f / (2.0f * sigmaR * sigmaR)) : 0.0f;
+    for (int i = 1; i <= r; ++i) {
+        float sp = exp(-0.5f * float(i * i) / sigmaS2);
+        for (int s = -1; s <= 1; s += 2) {
+            float v = src.sample(kLinear, uv + step * float(i * s)).r;
+            float dv = v - center;
+            float wgt = (invR2 > 0.0f) ? sp * exp(-dv * dv * invR2) : sp;
+            acc += v * wgt;
+            wsum += wgt;
+        }
+    }
+    return acc / max(wsum, 1e-5f);
+}
+
 kernel void luma_blur_h(texture2d<float, access::sample> src [[texture(0)]],
                         texture2d<float, access::write>  dst [[texture(1)]],
-                        constant float& radius               [[buffer(0)]],
+                        constant BlurParams& P               [[buffer(0)]],
                         uint2 gid                            [[thread_position_in_grid]])
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
     float2 size = float2(w, h);
     float2 uv = (float2(gid) + 0.5f) / size;
-    float acc = 0.0f, wsum = 0.0f;
-    int r = int(clamp(radius, 1.0f, 24.0f));
-    for (int i = -r; i <= r; ++i) {
-        float wgt = exp(-0.5f * float(i * i) / (0.35f * float(r * r) + 1.0f));
-        acc += luma(src.sample(kLinear, uv + float2(float(i), 0.0f) / size).rgb) * wgt;
-        wsum += wgt;
-    }
-    dst.write(float4(acc / wsum, 0, 0, 1), gid);
+    int r = int(clamp(P.radius, 1.0f, 28.0f));
+    float v = bilateralLine(src, uv, float2(1.0f / size.x, 0.0f), r,
+                            0.35f * float(r * r) + 1.0f, P.sigmaStops);
+    dst.write(float4(v, 0, 0, 1), gid);
 }
 
 kernel void luma_blur_v(texture2d<float, access::sample> src [[texture(0)]],
                         texture2d<float, access::write>  dst [[texture(1)]],
-                        constant float& radius               [[buffer(0)]],
+                        constant BlurParams& P               [[buffer(0)]],
                         uint2 gid                            [[thread_position_in_grid]])
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
     float2 size = float2(w, h);
     float2 uv = (float2(gid) + 0.5f) / size;
-    float acc = 0.0f, wsum = 0.0f;
-    int r = int(clamp(radius, 1.0f, 24.0f));
-    for (int i = -r; i <= r; ++i) {
-        float wgt = exp(-0.5f * float(i * i) / (0.35f * float(r * r) + 1.0f));
-        acc += src.sample(kLinear, uv + float2(0.0f, float(i)) / size).r * wgt;
-        wsum += wgt;
-    }
-    dst.write(float4(acc / wsum, 0, 0, 1), gid);
+    int r = int(clamp(P.radius, 1.0f, 28.0f));
+    float v = bilateralLine(src, uv, float2(0.0f, 1.0f / size.y), r,
+                            0.35f * float(r * r) + 1.0f, P.sigmaStops);
+    dst.write(float4(v, 0, 0, 1), gid);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,41 +395,71 @@ kernel void tone_color(texture2d<float, access::read>   src      [[texture(0)]],
     // (a) 화이트밸런스 — 선형에서 채널 게인
     c *= float3(P.tempScaleR, P.tempScaleG, P.tempScaleB);
 
-    // (b) 노출
-    c *= exp2(P.exposure);
+    // (b) 노출 (사용자 + 장면 자동)
+    float gain = exp2(P.exposure);
+    c *= gain;
 
-    // (c) 로컬 하이라이트/섀도우 — 블러된 휘도를 마스크로
-    float lb = lumaMask.sample(kLinear, (float2(gid) + 0.5f) / float2(w, h)).r;
-    float hiMask = smoothstep(0.25f, 1.10f, lb);
-    float shMask = 1.0f - smoothstep(0.0f, 0.45f, lb);
-    c *= exp2(P.highlights * 1.7f * hiMask);
-    c *= exp2(P.shadows * 1.5f * shMask);
+    // (c) 블랙 포인트를 선형에서 뺀다 — 베일링 플레어(뿌연 안개)를 걷어낸다.
+    //     이게 없으면 역광·실내 반사가 있는 장면이 통째로 희뿌옇게 나온다.
+    float bp = P.blackPoint;
+    float invBp = 1.0f / max(1.0f - bp, 1e-3f);
+    c = max(c - bp, 0.0f) * invBp;
 
-    // (d) 하이라이트 숄더 — 클리핑 대신 부드럽게 눕힘 (화이트로 지점 조절)
-    float white = mix(1.9f, 0.85f, clamp(P.whites * 0.5f + 0.5f, 0.0f, 1.0f));
-    c = filmicShoulder(c, white);
+    // (d) 베이스/디테일 분해 (Durand).
+    //     마스크는 보정 전 로그 휘도라서 같은 변환을 스칼라로 따라 적용한다.
+    float2 uv = (float2(gid) + 0.5f) / float2(w, h);
+    float baseRaw = exp2(lumaMask.sample(kLinear, uv).r) * P.wbLuma * gain;
+    baseRaw = max(baseRaw - bp, 0.0f) * invBp;
+    float logBase = log2(max(baseRaw, 1e-5f));
 
-    // (e) 디스플레이 감마
-    float3 g = encodeGamma(c);
+    float L = max(luma(c), 1e-5f);
+    float logDetail = clamp(log2(L) - logBase, -6.0f, 6.0f);   // 국소 디테일(스톱)
 
-    // (f) 블랙 포인트
-    float blackLift = P.blacks * 0.22f;
+    // (e) 베이스에만 톤을 건다 — 섀도우를 크게 올려도 국소 대비가 남는다.
+    //     존 가중치는 로그 공간에서 계산한다. z: -7EV→0, +1EV→1
+    float z = saturate((logBase + 7.0f) / 8.0f);
+    float hiMask = smoothstep(0.58f, 0.97f, z);
+    float shMask = 1.0f - smoothstep(0.16f, 0.56f, z);
+    float lb = logBase + P.highlights * 0.9f * hiMask + P.shadows * 0.85f * shMask;
+
+    // (f) 대비 = 미드그레이(0.18) 기준 로그 기울기. 필름 감마와 같은 방식.
+    const float kPivot = -2.4739312f;                  // log2(0.18)
+    lb = kPivot + (lb - kPivot) * exp2(P.contrast * 0.45f);
+
+    // (g) 필름 숄더 — 장면의 실제 최대 휘도(white)를 1.0 으로 눕힌다.
+    //     하이라이트가 잘리는 게 아니라 길게 누워서 '카메라처럼' 보인다.
+    float baseDisp = filmicShoulder(float3(exp2(lb)), P.white).x;
+
+    // (h) 디테일 복원
+    float Ld = clamp(baseDisp * exp2(logDetail * P.detailGain), 0.0f, 1.0f);
+
+    // (i) 색은 비율로 옮긴다 → 색상/채도가 틀어지지 않는다
+    float3 outLin = c * (Ld / L);
+
+    // (j) 아주 밝은 곳은 흰색으로 모은다 (형광등·창문이 색을 띠지 않게)
+    float over = saturate((Ld - 0.82f) / 0.30f);
+    outLin = mix(outLin, float3(Ld), over * 0.8f);
+
+    // (k) 감마 인코딩 — 파이프라인 전체에서 딱 한 번
+    float3 g = encodeGamma(outLin);
+
+    // (l) 블랙 엔드포인트 (슬라이더)
+    float blackLift = P.blacks * 0.18f;
     g = (blackLift >= 0.0f) ? (g * (1.0f - blackLift) + blackLift)
                             : max((g + blackLift) / (1.0f + blackLift), 0.0f);
 
-    // (g) 대비
-    g = float3(applyContrast(g.r, P.contrast),
-               applyContrast(g.g, P.contrast),
-               applyContrast(g.b, P.contrast));
-
-    // (h) 채도 / 생동감
+    // (m) 채도 / 생동감
     float lum = dot(g, kLumaRec709);
     float mx = max(max(g.r, g.g), g.b);
     float mn = min(min(g.r, g.g), g.b);
     float sat = (mx - mn) / max(mx, 1e-4f);
-    // 생동감: 저채도일수록 많이, 살색(주황 계열)은 보호
-    float skin = 1.0f - smoothstep(0.0f, 0.35f, abs(atan2(g.r - lum, g.g - lum) - 0.6f));
-    float vib = P.vibrance * (1.0f - sat) * (1.0f - 0.55f * skin);
+    // 살색 보호: R ≥ G ≥ B 이면서 (G-B)/(R-B) 가 0.55 근처면 피부
+    float skin = 0.0f;
+    if (g.r >= g.g && g.g >= g.b && (g.r - g.b) > 0.02f) {
+        float ratio = (g.g - g.b) / (g.r - g.b);
+        skin = saturate(1.0f - 3.2f * abs(ratio - 0.55f));
+    }
+    float vib = P.vibrance * (1.0f - sat * sat) * (1.0f - 0.6f * skin);
     g = mix(float3(lum), g, clamp(1.0f + vib + P.saturation, 0.0f, 3.0f));
 
     dst.write(float4(clamp(g, 0.0f, 1.0f), 1), gid);
@@ -473,13 +555,14 @@ kernel void bokeh_gather(texture2d<float, access::sample> src [[texture(0)]],  /
     float3 acc = 0.0f;
     float wsum = 0.0f;
     int rings = int(max(P.rings, 1.0f));
+    // 픽셀마다 샘플 각도를 돌려준다 — 링 수를 줄여도 줄무늬가 안 생긴다
+    float jitter = hash12(float2(gid) * 1.7f + P.rotation) * 6.2831853f;
 
     for (int ri = 0; ri <= rings; ++ri) {
         float t = float(ri) / float(rings);
-        float rr = t * R;
         int samples = (ri == 0) ? 1 : max(6, int(6.0f * float(ri)));
         for (int si = 0; si < samples; ++si) {
-            float ang = 2.0f * M_PI_F * float(si) / float(samples) + P.rotation + float(ri) * 0.37f;
+            float ang = 2.0f * M_PI_F * float(si) / float(samples) + jitter + float(ri) * 0.37f;
             float2 dir = float2(cos(ang), sin(ang));
             // 조리개 날 모양
             float shape = apertureRadius(ang, P.blades, P.curvature);
@@ -572,7 +655,8 @@ kernel void finish(texture2d<float, access::sample> src [[texture(0)]],
 
     // 비네팅 (부드러운 코사인 4제곱 느낌)
     if (abs(P.vignette) > 0.001f) {
-        float v = 1.0f - P.vignette * 0.9f * smoothstep(0.25f, 1.35f, rad);
+        // 라이트룸과 같은 부호: 음수 = 네 귀퉁이가 어두워진다
+        float v = 1.0f + P.vignette * 0.9f * smoothstep(0.25f, 1.35f, rad);
         c *= clamp(v, 0.0f, 2.0f);
     }
 
@@ -635,6 +719,51 @@ kernel void downsample_coc(texture2d<float, access::sample> src [[texture(0)]],
         }
     }
     dst.write(float4(best * scale, 0, 0, 1), gid);
+}
+
+// 톤 매핑용 '로그2 휘도' 축소. 선형 평균이 아니라 로그 평균을 내야
+// 밝은 점 하나가 타일 전체를 끌어올리지 않는다.
+kernel void log_downsample(texture2d<float, access::sample> src [[texture(0)]],
+                           texture2d<float, access::write>  dst [[texture(1)]],
+                           constant float& ratio                [[buffer(0)]],
+                           uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 size = float2(w, h);
+    float2 uv = (float2(gid) + 0.5f) / size;
+    int taps = int(clamp(ratio, 1.0f, 4.0f));
+    float acc = 0.0f;
+    float span = 1.0f / float(taps);
+    for (int y = 0; y < taps; ++y) {
+        for (int x = 0; x < taps; ++x) {
+            float2 o = (float2(x, y) + 0.5f) * span - 0.5f;
+            float L = luma(src.sample(kLinear, uv + o / size).rgb);
+            acc += log2(max(L, 1e-5f));
+        }
+    }
+    dst.write(float4(acc / float(taps * taps), 0, 0, 1), gid);
+}
+
+// 장면 분석용: 넓게 층화 샘플링한 로그 휘도 (CPU 가 읽어 히스토그램을 만든다)
+kernel void analyze_luma(texture2d<float, access::sample> src [[texture(0)]],
+                         texture2d<float, access::write>  dst [[texture(1)]],
+                         uint2 gid                            [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 size = float2(w, h);
+    float2 base = float2(gid) / size;
+    float2 cell = 1.0f / size;
+    float acc = 0.0f;
+    for (int y = 0; y < 3; ++y) {
+        for (int x = 0; x < 3; ++x) {
+            float2 uv = base + (float2(x, y) + 0.5f) / 3.0f * cell;
+            float L = luma(src.sample(kLinear, uv).rgb);
+            acc += log2(max(L, 1e-5f));
+        }
+    }
+    dst.write(float4(acc / 9.0f, 0, 0, 1), gid);
 }
 
 // 저해상 휘도 마스크 만들기 (풀해상도 중간 버퍼 없이 바로 축소 + 휘도화)

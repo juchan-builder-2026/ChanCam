@@ -5,7 +5,38 @@ import Foundation
 import SwiftUI
 import UIKit
 
-/// 촬영 담당. 48MP Apple ProRAW + LiDAR 깊이 + 인물 매트를 한 번에 받는다.
+/// 48MP ProRAW 와 사진 출력의 깊이 전달은 동시에 못 쓴다 — 48MP 가 조용히 떨어지거나
+/// 깊이가 아예 안 온다 (v1.0 에서 LiDAR 가 안 찍힌 이유). 그래서 깊이는 전용 출력으로
+/// 계속 흘려 받고 셔터 순간의 마지막 프레임을 붙인다. 해상도도 지키고 깊이도 얻는 길.
+final class DepthBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AVDepthData?
+    private var distance: Float = 0
+    private var publishedStamp = 0
+
+    func store(_ depth: AVDepthData, distance: Float) {
+        lock.lock(); defer { lock.unlock() }
+        value = depth
+        self.distance = distance
+    }
+    var latest: AVDepthData? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+    var latestDistance: Float {
+        lock.lock(); defer { lock.unlock() }
+        return distance
+    }
+    /// 화면 갱신 throttle — 같은 1/4초 구간이면 false
+    func shouldPublish(_ stamp: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard stamp != publishedStamp else { return false }
+        publishedStamp = stamp
+        return true
+    }
+}
+
+/// 촬영 담당. 48MP Apple ProRAW + LiDAR 깊이 + 인물 분리를 한 번에 받는다.
 ///
 /// 기기가 어떤 조합을 지원하는지는 실행 시점에만 알 수 있어서,
 /// 우선순위대로 시도하고 실제로 잡힌 구성을 `modeLabel` 로 보여준다.
@@ -27,13 +58,17 @@ final class Camera: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     private let output = AVCapturePhotoOutput()
+    private let depthOutput = AVCaptureDepthDataOutput()
     private let sessionQueue = DispatchQueue(label: "com.chan.cam.session")
+    private let depthQueue = DispatchQueue(label: "com.chan.cam.depth")
     private var device: AVCaptureDevice?
     private var proRAWFormat: OSType?
     private var supportsDepth = false
-    private var supportsMatte = false
+    private var streamingDepth = false
     private var pendingCaptures: [Int64: CaptureBundle] = [:]
-    private var latestDepthDistance: Float = 0
+
+    /// 스트리밍 깊이 보관함. 세션 큐·깊이 큐·메인 어디서나 읽어야 해서 락으로 지킨다.
+    private let depthBox = DepthBox()
 
     var onShot: ((Shot) -> Void)?
 
@@ -108,6 +143,24 @@ final class Camera: NSObject, ObservableObject {
         do {
             try device.lockForConfiguration()
             device.activeFormat = format
+            // 깊이 포맷을 직접 골라야 깊이가 흐른다 (기본값은 nil = 깊이 없음)
+            if withDepth {
+                let depthFormats = format.supportedDepthDataFormats.filter { candidate in
+                    let type = CMFormatDescriptionGetMediaSubType(candidate.formatDescription)
+                    return type == kCVPixelFormatType_DepthFloat32
+                        || type == kCVPixelFormatType_DepthFloat16
+                        || type == kCVPixelFormatType_DisparityFloat32
+                        || type == kCVPixelFormatType_DisparityFloat16
+                }
+                let pool = depthFormats.isEmpty ? format.supportedDepthDataFormats : depthFormats
+                if let best = pool.max(by: { a, b in
+                    let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+                    let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+                    return Int(da.width) * Int(da.height) < Int(db.width) * Int(db.height)
+                }) {
+                    device.activeDepthDataFormat = best
+                }
+            }
             if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
             if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
             device.unlockForConfiguration()
@@ -139,12 +192,29 @@ final class Camera: NSObject, ObservableObject {
             proRAWFormat = output.availableRawPhotoPixelFormatTypes.first
         }
 
-        if withDepth, output.isDepthDataDeliverySupported {
-            output.isDepthDataDeliveryEnabled = true
+        // 4) 깊이 — 사진 출력의 깊이 전달이 아니라 전용 스트리밍 출력을 쓴다.
+        //    (사진 깊이 전달을 켜면 48MP 를 못 쓰고, 실제로 깊이가 안 오는 경우도 있다)
+        streamingDepth = false
+        if withDepth {
+            if session.outputs.contains(depthOutput) == false, session.canAddOutput(depthOutput) {
+                session.addOutput(depthOutput)
+            }
+            if session.outputs.contains(depthOutput) {
+                depthOutput.isFilteringEnabled = true
+                depthOutput.alwaysDiscardsLateDepthData = true
+                depthOutput.setDelegate(self, callbackQueue: depthQueue)
+                if let connection = depthOutput.connection(with: .depthData) {
+                    connection.isEnabled = true
+                    if connection.isVideoRotationAngleSupported(90) {
+                        connection.videoRotationAngle = 90   // 사진과 같은 세로 방향으로
+                    }
+                    streamingDepth = connection.isEnabled
+                }
+            }
         }
-        if output.isDepthDataDeliveryEnabled, output.isPortraitEffectsMatteDeliverySupported {
-            output.isPortraitEffectsMatteDeliveryEnabled = true
-            supportsMatte = true
+        // 스트리밍이 안 되면 사진 깊이 전달로 폴백 (해상도를 양보하고 깊이를 얻는다)
+        if !streamingDepth, withDepth, output.isDepthDataDeliverySupported {
+            output.isDepthDataDeliveryEnabled = true
         }
 
         output.connection(with: .video)?.videoRotationAngle = 90
@@ -154,11 +224,13 @@ final class Camera: NSObject, ObservableObject {
         let dims = output.maxPhotoDimensions
         let mp = Double(dims.width) * Double(dims.height) / 1_000_000
         let raw = output.isAppleProRAWEnabled ? "ProRAW" : (proRAWFormat != nil ? "RAW" : "압축")
-        let depthText = output.isDepthDataDeliveryEnabled ? " · LiDAR 깊이" : " · 깊이 없음"
-        let matteText = supportsMatte ? " · 인물 매트" : ""
+        let hasDepth = streamingDepth || output.isDepthDataDeliveryEnabled
+        let depthText = streamingDepth ? " · LiDAR 깊이(스트림)"
+            : (hasDepth ? " · 깊이" : " · 깊이 없음")
+        let matteText = hasDepth ? " · 인물 분리" : ""
         Task { @MainActor in
             self.isReady = true
-            self.modeLabel = String(format: "%.0fMP %@", mp.rounded(), raw)
+            self.modeLabel = String(format: "%.0fMP %@", mp.rounded(.down), raw)
             self.detailLabel = "\(dims.width)×\(dims.height)\(depthText)\(matteText)"
         }
     }
@@ -213,7 +285,6 @@ final class Camera: NSObject, ObservableObject {
             try? await Task.sleep(for: .milliseconds(90))
             self.flashOverlay = false
         }
-        let focusNow = latestDepthDistance
         sessionQueue.async { [weak self] in
             guard let self else { return }
             let settings: AVCapturePhotoSettings
@@ -231,12 +302,10 @@ final class Camera: NSObject, ObservableObject {
                 settings.embedsDepthDataInPhoto = false
                 settings.isDepthDataFiltered = true
             }
-            if self.output.isPortraitEffectsMatteDeliveryEnabled {
-                settings.isPortraitEffectsMatteDeliveryEnabled = true
-                settings.embedsPortraitEffectsMatteInPhoto = false
-            }
             let bundle = CaptureBundle()
-            bundle.focusDistance = focusNow
+            // 셔터 순간의 마지막 LiDAR 프레임을 붙인다
+            bundle.depth = self.depthBox.latest
+            bundle.focusDistance = self.depthBox.latestDistance
             self.pendingCaptures[settings.uniqueID] = bundle
             self.output.capturePhoto(with: settings, delegate: self)
         }
@@ -313,6 +382,50 @@ extension Camera: AVCapturePhotoCaptureDelegate {
                 self.lastError = "저장 실패 — \(error.localizedDescription)"
             }
         }
+    }
+}
+
+// MARK: - 깊이 스트림
+
+extension Camera: AVCaptureDepthDataOutputDelegate {
+
+    nonisolated func depthDataOutput(_ output: AVCaptureDepthDataOutput,
+                                     didOutput depthData: AVDepthData,
+                                     timestamp: CMTime,
+                                     connection: AVCaptureConnection) {
+        let converted = depthData.depthDataType == kCVPixelFormatType_DepthFloat32
+            ? depthData
+            : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+        let distance = Camera.centerDistance(converted.depthDataMap)
+        depthBox.store(converted, distance: distance)
+
+        // 화면 표시는 초당 몇 번이면 충분하다
+        if depthBox.shouldPublish(Int(timestamp.seconds * 4)) {
+            Task { @MainActor in self.liveFocusDistance = distance }
+        }
+    }
+
+    /// 중앙 1/3 영역의 유효 깊이 중앙값 (m)
+    nonisolated static func centerDistance(_ buffer: CVPixelBuffer) -> Float {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        guard width > 8, height > 8, let base = CVPixelBufferGetBaseAddress(buffer) else { return 0 }
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        var samples: [Float] = []
+        samples.reserveCapacity(512)
+        let step = max(min(width, height) / 24, 1)
+        for y in stride(from: height / 3, to: height * 2 / 3, by: step) {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float.self)
+            for x in stride(from: width / 3, to: width * 2 / 3, by: step) {
+                let v = row[x]
+                if v.isFinite, v > 0.05, v < 40 { samples.append(v) }
+            }
+        }
+        guard !samples.isEmpty else { return 0 }
+        samples.sort()
+        return samples[samples.count / 2]
     }
 }
 
