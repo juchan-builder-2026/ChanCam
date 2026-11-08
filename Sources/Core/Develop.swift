@@ -188,7 +188,7 @@ struct DevelopSettings: Codable, Equatable {
         coma = f(.coma, coma)
 
         rotation = f(.rotation, rotation)
-        if let saved = try? c.decodeIfPresent(CropRect.self, forKey: .cropRect), let saved {
+        if let saved = try? c.decodeIfPresent(CropRect.self, forKey: .cropRect) {
             cropRect = saved
         }
     }
