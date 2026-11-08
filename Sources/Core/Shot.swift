@@ -55,8 +55,8 @@ struct Shot: Codable, Identifiable, Equatable {
             ((try? c.decodeIfPresent(Bool.self, forKey: k)) ?? nil) ?? d
         }
 
-        if let value = try? c.decodeIfPresent(UUID.self, forKey: .id), let value { id = value }
-        if let value = try? c.decodeIfPresent(Date.self, forKey: .date), let value { date = value }
+        if let value = try? c.decodeIfPresent(UUID.self, forKey: .id) { id = value }
+        if let value = try? c.decodeIfPresent(Date.self, forKey: .date) { date = value }
         rawFile = s(.rawFile, rawFile)
         depthFile = (try? c.decodeIfPresent(String.self, forKey: .depthFile)) ?? nil
         matteFile = (try? c.decodeIfPresent(String.self, forKey: .matteFile)) ?? nil
@@ -77,7 +77,7 @@ struct Shot: Codable, Identifiable, Equatable {
         isProRAW = b(.isProRAW, isProRAW)
         isFavorite = b(.isFavorite, isFavorite)
         exportedAt = (try? c.decodeIfPresent(Date.self, forKey: .exportedAt)) ?? nil
-        if let value = try? c.decodeIfPresent(DevelopSettings.self, forKey: .develop), let value {
+        if let value = try? c.decodeIfPresent(DevelopSettings.self, forKey: .develop) {
             develop = value
         }
     }
