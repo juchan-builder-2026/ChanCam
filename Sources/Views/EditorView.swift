@@ -18,6 +18,7 @@ struct EditorView: View {
     @State private var showInfo = false
     @State private var renderTask: Task<Void, Never>?
     @State private var loaded = false
+    @State private var showDevelop = false
 
     private var isDemo: Bool { ProcessInfo.processInfo.arguments.contains("-demo") }
     private var changed: Bool { settings != original }
@@ -50,14 +51,17 @@ struct EditorView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         save()
-                        processor.enqueue(shot)
+                        showDevelop = true
                     } label: {
-                        Image(systemName: "square.and.arrow.down")
+                        Image(systemName: "wand.and.rays")
                     }
-                    .disabled(!store.hasRaw(shot))
+                    .disabled(!store.hasRaw(shot) || processor.isDeveloping)
                 }
             }
             .sheet(isPresented: $showInfo) { ShotInfoView(shot: shot) }
+            .sheet(isPresented: $showDevelop) {
+                DevelopView(shots: [store.shots.first(where: { $0.id == shot.id }) ?? shot])
+            }
         }
         .onAppear(perform: load)
         .onDisappear { renderTask?.cancel(); save() }
@@ -203,6 +207,15 @@ struct EditorView: View {
                     if settings.bokehEnabled && shot.hasDepth {
                         BokehInfoRow(settings: settings, shot: shot)
                     }
+                }
+
+                if let note = group.note {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.45))
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                        .padding(.bottom, 6)
                 }
 
                 ForEach(group.sliders) { slider in

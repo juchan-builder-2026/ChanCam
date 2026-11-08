@@ -20,9 +20,6 @@ final class ShotStore: ObservableObject {
     @AppStorage("keepRawAfterExport") var keepRawAfterExport = true {
         didSet { objectWillChange.send() }
     }
-    @AppStorage("autoExport") var autoExport = true
-    @AppStorage("saveToPhotos") var saveToPhotos = true
-    @AppStorage("jpegQuality") var jpegQuality = 0.95
     /// 촬영 화면에서 고른 프리셋 번호 — 저장할 때 바로 적용된다
     @AppStorage("capturePreset") var capturePreset = 0
 
@@ -168,12 +165,12 @@ final class ShotStore: ObservableObject {
         persist()
     }
 
-    func markExported(_ id: UUID, file: String) {
+    func markExported(_ id: UUID, file: String, keepRaw: Bool? = nil) {
         guard let index = shots.firstIndex(where: { $0.id == id }) else { return }
         shots[index].exportFile = file
         shots[index].exportedAt = Date()
         // 용량 절약: 원본을 남기지 않는 설정이면 DNG 삭제
-        if !keepRawAfterExport, shots[index].isProRAW {
+        if !(keepRaw ?? keepRawAfterExport), shots[index].isProRAW {
             let target = folder(shots[index]).appendingPathComponent(shots[index].rawFile)
             try? FileManager.default.removeItem(at: target)
         }
@@ -210,6 +207,11 @@ final class ShotStore: ObservableObject {
     }
 
     func hasRaw(_ shot: Shot) -> Bool { rawURL(shot) != nil }
+
+    /// 아직 현상하지 않은 사진들 (원본이 남아 있는 것만)
+    var undeveloped: [Shot] {
+        shots.filter { $0.exportedAt == nil && rawURL($0) != nil }
+    }
 
     // MARK: - 용량
 

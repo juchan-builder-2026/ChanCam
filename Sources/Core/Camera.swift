@@ -13,11 +13,22 @@ final class DepthBox: @unchecked Sendable {
     private var value: AVDepthData?
     private var distance: Float = 0
     private var publishedStamp = 0
+    private var frames = 0
+    private var coverage: Double = 0
+    private var fps: Double = 0
+    private var lastTimestamp: Double = 0
 
-    func store(_ depth: AVDepthData, distance: Float) {
+    func store(_ depth: AVDepthData, distance: Float, coverage: Double, timestamp: Double) {
         lock.lock(); defer { lock.unlock() }
         value = depth
         self.distance = distance
+        self.coverage = coverage
+        frames += 1
+        if lastTimestamp > 0, timestamp > lastTimestamp {
+            let instant = 1 / (timestamp - lastTimestamp)
+            fps = fps > 0 ? fps * 0.8 + instant * 0.2 : instant
+        }
+        lastTimestamp = timestamp
     }
     var latest: AVDepthData? {
         lock.lock(); defer { lock.unlock() }
@@ -27,6 +38,11 @@ final class DepthBox: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return distance
     }
+    /// (fps, 유효 픽셀 비율, 받은 프레임 수) — 센서 테스터용
+    var stats: (fps: Double, coverage: Double, frames: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (fps, coverage, frames)
+    }
     /// 화면 갱신 throttle — 같은 1/4초 구간이면 false
     func shouldPublish(_ stamp: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -34,6 +50,30 @@ final class DepthBox: @unchecked Sendable {
         publishedStamp = stamp
         return true
     }
+}
+
+/// 세션을 실제로 구성한 뒤 확정된 하드웨어 능력. 센서 테스터가 이걸 읽는다.
+/// (세션에 붙기 전의 AVCapturePhotoOutput 은 전부 false 라서 의미가 없다.)
+struct CameraCapabilities: Sendable {
+    var configured = false
+    var deviceName = "—"
+    var proRAW = false
+    var proRAWEnabled = false
+    var depthDelivery = false
+    var streamingDepth = false
+    var portraitMatte = false
+    var distortionCorrection = false
+    var zeroShutterLag = false
+    var responsiveCapture = false
+    var rawFormats = 0
+    var maxPhotoWidth = 0
+    var maxPhotoHeight = 0
+    var depthWidth = 0
+    var depthHeight = 0
+}
+
+extension Camera {
+    typealias Capabilities = CameraCapabilities
 }
 
 /// 촬영 담당. 48MP Apple ProRAW + LiDAR 깊이 + 인물 분리를 한 번에 받는다.
@@ -52,6 +92,10 @@ final class Camera: NSObject, ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var permissionDenied = false
     @Published private(set) var liveFocusDistance: Float = 0
+    @Published private(set) var capabilities = CameraCapabilities()
+    @Published private(set) var depthFPS: Double = 0
+    @Published private(set) var depthCoverage: Double = 0
+    @Published private(set) var depthFrames = 0
 
     /// 촬영 직후 셔터 피드백용
     @Published private(set) var flashOverlay = false
@@ -228,11 +272,41 @@ final class Camera: NSObject, ObservableObject {
         let depthText = streamingDepth ? " · LiDAR 깊이(스트림)"
             : (hasDepth ? " · 깊이" : " · 깊이 없음")
         let matteText = hasDepth ? " · 인물 분리" : ""
+
+        var caps = CameraCapabilities()
+        caps.configured = true
+        caps.deviceName = device.localizedName
+        caps.proRAW = output.isAppleProRAWSupported
+        caps.proRAWEnabled = output.isAppleProRAWEnabled
+        caps.depthDelivery = output.isDepthDataDeliverySupported
+        caps.streamingDepth = streamingDepth
+        caps.portraitMatte = output.isPortraitEffectsMatteDeliverySupported
+        caps.distortionCorrection = output.isContentAwareDistortionCorrectionSupported
+        caps.zeroShutterLag = output.isZeroShutterLagSupported
+        caps.responsiveCapture = output.isResponsiveCaptureSupported
+        caps.rawFormats = output.availableRawPhotoPixelFormatTypes.count
+        caps.maxPhotoWidth = Int(dims.width)
+        caps.maxPhotoHeight = Int(dims.height)
+        if let activeDepth = device.activeDepthDataFormat {
+            let d = CMVideoFormatDescriptionGetDimensions(activeDepth.formatDescription)
+            caps.depthWidth = Int(d.width)
+            caps.depthHeight = Int(d.height)
+        }
+
         Task { @MainActor in
             self.isReady = true
             self.modeLabel = String(format: "%.0fMP %@", mp.rounded(.down), raw)
             self.detailLabel = "\(dims.width)×\(dims.height)\(depthText)\(matteText)"
+            self.capabilities = caps
         }
+    }
+
+    /// 센서 테스터가 주기적으로 호출 — 깊이 스트림 통계를 화면으로 올린다
+    func refreshDepthStats() {
+        let stats = depthBox.stats
+        depthFPS = stats.fps
+        depthCoverage = stats.coverage
+        depthFrames = stats.frames
     }
 
     /// 깊이를 지원하면서 가장 해상도가 높은 포맷
@@ -396,36 +470,56 @@ extension Camera: AVCaptureDepthDataOutputDelegate {
         let converted = depthData.depthDataType == kCVPixelFormatType_DepthFloat32
             ? depthData
             : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-        let distance = Camera.centerDistance(converted.depthDataMap)
-        depthBox.store(converted, distance: distance)
+        let measured = Camera.measure(converted.depthDataMap)
+        depthBox.store(converted, distance: measured.distance,
+                       coverage: measured.coverage, timestamp: timestamp.seconds)
 
         // 화면 표시는 초당 몇 번이면 충분하다
         if depthBox.shouldPublish(Int(timestamp.seconds * 4)) {
-            Task { @MainActor in self.liveFocusDistance = distance }
+            let stats = depthBox.stats
+            Task { @MainActor in
+                self.liveFocusDistance = measured.distance
+                self.depthFPS = stats.fps
+                self.depthCoverage = stats.coverage
+                self.depthFrames = stats.frames
+            }
         }
     }
 
-    /// 중앙 1/3 영역의 유효 깊이 중앙값 (m)
-    nonisolated static func centerDistance(_ buffer: CVPixelBuffer) -> Float {
+    /// 중앙 1/3 영역의 유효 깊이 중앙값(m)과 화면 전체의 유효 픽셀 비율을 한 번에 센다.
+    /// 유효 비율은 "LiDAR 가 정말 읽고 있나"를 보는 가장 직접적인 숫자다.
+    nonisolated static func measure(_ buffer: CVPixelBuffer) -> (distance: Float, coverage: Double) {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let width = CVPixelBufferGetWidth(buffer)
         let height = CVPixelBufferGetHeight(buffer)
-        guard width > 8, height > 8, let base = CVPixelBufferGetBaseAddress(buffer) else { return 0 }
+        guard width > 8, height > 8, let base = CVPixelBufferGetBaseAddress(buffer) else {
+            return (0, 0)
+        }
         let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let isDisparity = CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_DisparityFloat32
         var samples: [Float] = []
         samples.reserveCapacity(512)
-        let step = max(min(width, height) / 24, 1)
-        for y in stride(from: height / 3, to: height * 2 / 3, by: step) {
+        var valid = 0, total = 0
+        let step = max(min(width, height) / 32, 1)
+        let cx0 = width / 3, cx1 = width * 2 / 3
+        let cy0 = height / 3, cy1 = height * 2 / 3
+        for y in stride(from: 0, to: height, by: step) {
             let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float.self)
-            for x in stride(from: width / 3, to: width * 2 / 3, by: step) {
-                let v = row[x]
-                if v.isFinite, v > 0.05, v < 40 { samples.append(v) }
+            for x in stride(from: 0, to: width, by: step) {
+                var v = row[x]
+                total += 1
+                guard v.isFinite, v > 0 else { continue }
+                if isDisparity { v = 1 / v }
+                guard v > 0.05, v < 40 else { continue }
+                valid += 1
+                if x >= cx0, x < cx1, y >= cy0, y < cy1 { samples.append(v) }
             }
         }
-        guard !samples.isEmpty else { return 0 }
+        let coverage = total > 0 ? Double(valid) / Double(total) : 0
+        guard !samples.isEmpty else { return (0, coverage) }
         samples.sort()
-        return samples[samples.count / 2]
+        return (samples[samples.count / 2], coverage)
     }
 }
 

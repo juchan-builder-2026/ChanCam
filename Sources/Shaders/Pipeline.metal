@@ -1,139 +1,13 @@
-#include <metal_stdlib>
-using namespace metal;
+#include "Common.h"
 
 // ============================================================================
 //  ChanCam 현상 파이프라인
 //  입력은 CIRAWFilter 가 디코드한 선형(linear) 장면 참조 RGB (RGBA16Float).
 //  모든 단계는 선형에서 처리하고 마지막에만 디스플레이 감마로 인코딩한다.
 //  보케는 반드시 선형 HDR 에서 해야 하이라이트가 보케 볼로 피어난다.
+//
+//  구조체·공용 함수는 Common.h 에 있다 (Advanced.metal 과 공유).
 // ============================================================================
-
-constant float3 kLumaRec709 = float3(0.2126f, 0.7152f, 0.0722f);
-constant sampler kLinear(coord::normalized, address::clamp_to_edge, filter::linear);
-constant sampler kNearest(coord::normalized, address::clamp_to_edge, filter::nearest);
-
-// ---------------------------------------------------------------------------
-//  파라미터 (Swift 쪽 구조체와 메모리 배치가 같아야 함: float 만 사용)
-// ---------------------------------------------------------------------------
-
-struct ToneParams {
-    float exposure;       // EV (사용자 + 자동 분석)
-    float contrast;       // -1 ... 1
-    float highlights;     // -1 ... 1
-    float shadows;        // -1 ... 1
-    float whites;         // -1 ... 1
-    float blacks;         // -1 ... 1
-    float vibrance;       // -1 ... 1
-    float saturation;     // -1 ... 1
-    float tempScaleR;     // 화이트밸런스 채널 게인
-    float tempScaleG;
-    float tempScaleB;
-    float wbLuma;         // 위 게인의 휘도 (마스크 보정용)
-    float white;          // 필름 숄더 백포인트 (선형). 장면 분석에서 나온다
-    float blackPoint;     // 선형 블랙 (베일링 플레어 제거). 장면 분석
-    float detailGain;     // 베이스를 압축한 만큼 디테일을 되살리는 양 (1.0 ~ 1.4)
-    float _pad0;
-};
-
-struct BlurParams {
-    float radius;         // px
-    float sigmaStops;     // 바이래터럴 레인지 시그마 (스톱 단위). 0 이면 일반 가우시안
-    float _pad0;
-    float _pad1;
-};
-
-struct DetailParams {
-    float sharpness;      // 0 ... 1.5
-    float radius;         // px
-    float texture;        // -1 ... 1
-    float clarity;        // -1 ... 1
-    float lumaNR;         // 0 ... 1
-    float colorNR;        // 0 ... 1
-    float _pad0;
-    float _pad1;
-};
-
-struct BokehParams {
-    float maxRadius;      // 게더 반경 (px, 현재 해상도 기준)
-    float rings;          // 샘플 링 수
-    float blades;         // 조리개 날 수 (0 = 원형)
-    float curvature;      // 0 = 다각형, 1 = 원형
-    float bloom;          // 하이라이트 블룸
-    float catsEye;        // 0 ... 1
-    float ring;           // 구면수차(링 보케)
-    float rotation;       // 조리개 회전 (rad)
-};
-
-struct CoCParams {
-    float focusDistance;  // m
-    float focalLength;    // mm (35mm 환산)
-    float fNumber;
-    float sensorWidth;    // mm (풀프레임 36)
-    float imageWidth;     // px
-    float maxCoC;         // px 상한
-    float _pad0;
-    float _pad1;
-};
-
-struct FinishParams {
-    float vignette;       // -1 ... 1
-    float grain;          // 0 ... 1
-    float grainSize;      // px
-    float chroma;         // 색수차 0 ... 1
-    float seed;
-    float _pad0;
-    float _pad1;
-    float _pad2;
-};
-
-// ---------------------------------------------------------------------------
-//  공용 함수
-// ---------------------------------------------------------------------------
-
-inline float luma(float3 c) { return dot(max(c, 0.0f), kLumaRec709); }
-
-// 선형 → sRGB 감마
-inline float3 encodeGamma(float3 c) {
-    c = clamp(c, 0.0f, 1.0f);
-    return select(12.92f * c, 1.055f * pow(c, 1.0f / 2.4f) - 0.055f, c > 0.0031308f);
-}
-
-inline float3 decodeGamma(float3 c) {
-    c = clamp(c, 0.0f, 1.0f);
-    return select(c / 12.92f, pow((c + 0.055f) / 1.055f, 2.4f), c > 0.04045f);
-}
-
-// 하이라이트 소프트 클립 (필름 숄더). white 보다 위를 부드럽게 눕힌다.
-inline float3 filmicShoulder(float3 x, float white) {
-    float w = max(white, 1.0f);
-    return (x * (1.0f + x / (w * w))) / (1.0f + x);
-}
-
-// 디스플레이 공간 대비 S 커브
-inline float applyContrast(float x, float amount) {
-    x = clamp(x, 0.0f, 1.0f);
-    if (amount >= 0.0f) {
-        float s = x * x * (3.0f - 2.0f * x);       // smoothstep
-        return mix(x, s, clamp(amount, 0.0f, 1.0f));
-    }
-    float f = x * 0.62f + 0.19f;                    // 플랫
-    return mix(x, f, clamp(-amount, 0.0f, 1.0f));
-}
-
-// 조리개 날 모양: 각도에 따른 반경 배율
-inline float apertureRadius(float theta, float blades, float curvature) {
-    if (blades < 3.0f) return 1.0f;
-    float seg = 2.0f * M_PI_F / blades;
-    float a = fmod(theta + 4.0f * M_PI_F, seg) - seg * 0.5f;
-    float poly = cos(seg * 0.5f) / max(cos(a), 1e-3f);
-    return mix(min(poly, 1.0f), 1.0f, clamp(curvature, 0.0f, 1.0f));
-}
-
-inline float hash12(float2 p) {
-    float3 p3 = fract(float3(p.xyx) * 0.1031f);
-    p3 += dot(p3, p3.yzx + 33.33f);
-    return fract((p3.x + p3.y) * p3.z);
-}
 
 // ---------------------------------------------------------------------------
 //  1. 깊이 업샘플 — LiDAR 저해상 깊이를 색상 가이드로 조인트 바이래터럴 업샘플
@@ -381,14 +255,24 @@ kernel void luma_blur_v(texture2d<float, access::sample> src [[texture(0)]],
 //  5. 톤 + 컬러 — 선형에서 노출/로컬톤, 숄더, 감마, 대비, 엔드포인트, 컬러
 // ---------------------------------------------------------------------------
 
-kernel void tone_color(texture2d<float, access::read>   src      [[texture(0)]],
-                       texture2d<float, access::sample> lumaMask [[texture(1)]],
-                       texture2d<float, access::write>  dst      [[texture(2)]],
-                       constant ToneParams& P                    [[buffer(0)]],
-                       uint2 gid                                 [[thread_position_in_grid]])
+//  밴드 셋:
+//    coarse  = 아주 넓은 영역의 로그 휘도  → 전역 톤 연산자(숄더·대비·존)를 받는다
+//    fine    = 중간 영역의 로그 휘도       → 중역 로컬 대비 (localGain)
+//    detail  = 픽셀 − fine                 → 미세 디테일 (detailGain)
+//  이게 로컬 라플라시안과 같은 다중 스케일 분해다. 단일 스케일로 하면
+//  섀도우를 올릴 때 '중간이 평평해지는' HDR 티가 반드시 생긴다.
+
+kernel void tone_color(texture2d<float, access::read>   src     [[texture(0)]],
+                       texture2d<float, access::sample> fineTex [[texture(1)]],  // log2 휘도 (1/8)
+                       texture2d<float, access::sample> coarse  [[texture(2)]],  // log2 휘도 (1/16)
+                       texture2d<float, access::sample> darkTex [[texture(3)]],  // 선형 최소채널
+                       texture2d<float, access::write>  dst     [[texture(4)]],
+                       constant ToneParams& P                   [[buffer(0)]],
+                       uint2 gid                                [[thread_position_in_grid]])
 {
     uint w = dst.get_width(), h = dst.get_height();
     if (gid.x >= w || gid.y >= h) return;
+    float2 uv = (float2(gid) + 0.5f) / float2(w, h);
 
     float3 c = max(src.read(gid).rgb, 0.0f);
 
@@ -399,56 +283,81 @@ kernel void tone_color(texture2d<float, access::read>   src      [[texture(0)]],
     float gain = exp2(P.exposure);
     c *= gain;
 
-    // (c) 블랙 포인트를 선형에서 뺀다 — 베일링 플레어(뿌연 안개)를 걷어낸다.
+    // (c) 디헤이즈 — 다크 채널 프라이어. 투과율 t 를 추정해 대기광을 역산한다.
+    //     J = (I − A(1−t)) / t.  음수면 반대로 안개를 더한다.
+    if (abs(P.dehaze) > 0.002f) {
+        float A = max(P.airLight, 1e-3f);
+        float dark = max(darkTex.sample(kLinear, uv).r * P.wbLuma * gain, 0.0f);
+        float t = 1.0f - clamp(P.dehaze, -1.0f, 1.0f) * 0.90f * saturate(dark / A);
+        t = clamp(t, 0.12f, 2.5f);
+        c = max((c - A * (1.0f - t)) / t, 0.0f);
+    }
+
+    // (d) 블랙 포인트를 선형에서 뺀다 — 베일링 플레어(뿌연 안개)를 걷어낸다.
     //     이게 없으면 역광·실내 반사가 있는 장면이 통째로 희뿌옇게 나온다.
     float bp = P.blackPoint;
     float invBp = 1.0f / max(1.0f - bp, 1e-3f);
     c = max(c - bp, 0.0f) * invBp;
 
-    // (d) 베이스/디테일 분해 (Durand).
-    //     마스크는 보정 전 로그 휘도라서 같은 변환을 스칼라로 따라 적용한다.
-    float2 uv = (float2(gid) + 0.5f) / float2(w, h);
-    float baseRaw = exp2(lumaMask.sample(kLinear, uv).r) * P.wbLuma * gain;
-    baseRaw = max(baseRaw - bp, 0.0f) * invBp;
-    float logBase = log2(max(baseRaw, 1e-5f));
+    // (e) 다중 스케일 분해. 마스크는 보정 전 로그 휘도라서 같은 변환을 따라 적용한다.
+    float fineRaw = exp2(fineTex.sample(kLinear, uv).r) * P.wbLuma * gain;
+    fineRaw = max(fineRaw - bp, 0.0f) * invBp;
+    float logFine = log2(max(fineRaw, 1e-5f));
+
+    float logCoarse = logFine;
+    if (P.toneBands > 2.5f) {
+        float coarseRaw = exp2(coarse.sample(kLinear, uv).r) * P.wbLuma * gain;
+        coarseRaw = max(coarseRaw - bp, 0.0f) * invBp;
+        logCoarse = log2(max(coarseRaw, 1e-5f));
+    }
 
     float L = max(luma(c), 1e-5f);
-    float logDetail = clamp(log2(L) - logBase, -6.0f, 6.0f);   // 국소 디테일(스톱)
+    float bandMid = clamp(logFine - logCoarse, -5.0f, 5.0f);      // 중역 로컬 대비
+    float bandFine = clamp(log2(L) - logFine, -6.0f, 6.0f);       // 미세 디테일
 
-    // (e) 베이스에만 톤을 건다 — 섀도우를 크게 올려도 국소 대비가 남는다.
-    //     존 가중치는 로그 공간에서 계산한다. z: -7EV→0, +1EV→1
-    float z = saturate((logBase + 7.0f) / 8.0f);
+    // (f) 전역 톤은 coarse 에만 건다 → 로컬 대비가 통째로 보존된다.
+    //     존 가중치는 로그 공간. z: -7EV→0, +1EV→1
+    float z = saturate((logCoarse + 7.0f) / 8.0f);
     float hiMask = smoothstep(0.58f, 0.97f, z);
     float shMask = 1.0f - smoothstep(0.16f, 0.56f, z);
-    float lb = logBase + P.highlights * 0.9f * hiMask + P.shadows * 0.85f * shMask;
+    float lb = logCoarse + P.highlights * 0.9f * hiMask + P.shadows * 0.85f * shMask;
 
-    // (f) 대비 = 미드그레이(0.18) 기준 로그 기울기. 필름 감마와 같은 방식.
-    const float kPivot = -2.4739312f;                  // log2(0.18)
-    lb = kPivot + (lb - kPivot) * exp2(P.contrast * 0.45f);
+    // (g) 대비 = 미드그레이(0.18) 기준 로그 기울기. 필름 감마와 같은 방식.
+    lb = kPivotLog + (lb - kPivotLog) * exp2(P.contrast * 0.45f);
 
-    // (g) 필름 숄더 — 장면의 실제 최대 휘도(white)를 1.0 으로 눕힌다.
+    // (h) 필름 숄더 — 장면의 실제 최대 휘도(white)를 1.0 으로 눕힌다.
     //     하이라이트가 잘리는 게 아니라 길게 누워서 '카메라처럼' 보인다.
     float baseDisp = filmicShoulder(float3(exp2(lb)), P.white).x;
 
-    // (h) 디테일 복원
-    float Ld = clamp(baseDisp * exp2(logDetail * P.detailGain), 0.0f, 1.0f);
+    // (i) 밴드 재조립
+    float Ld = clamp(baseDisp * exp2(bandMid * P.localGain + bandFine * P.detailGain),
+                     0.0f, 1.0f);
 
-    // (i) 색은 비율로 옮긴다 → 색상/채도가 틀어지지 않는다
+    // (j) 색은 비율로 옮긴다 → 색상/채도가 틀어지지 않는다
     float3 outLin = c * (Ld / L);
 
-    // (j) 아주 밝은 곳은 흰색으로 모은다 (형광등·창문이 색을 띠지 않게)
+    // (k) 아주 밝은 곳은 흰색으로 모은다 (형광등·창문이 색을 띠지 않게)
     float over = saturate((Ld - 0.82f) / 0.30f);
     outLin = mix(outLin, float3(Ld), over * 0.8f);
 
-    // (k) 감마 인코딩 — 파이프라인 전체에서 딱 한 번
+    // (l) 감마 인코딩 — 파이프라인 전체에서 딱 한 번
     float3 g = encodeGamma(outLin);
 
-    // (l) 블랙 엔드포인트 (슬라이더)
+    // (m) 블랙 엔드포인트 (슬라이더)
     float blackLift = P.blacks * 0.18f;
     g = (blackLift >= 0.0f) ? (g * (1.0f - blackLift) + blackLift)
                             : max((g + blackLift) / (1.0f + blackLift), 0.0f);
 
-    // (m) 채도 / 생동감
+    // (n) 색 분리 (스플릿 토닝) — 섀도우/하이라이트에 서로 다른 색을 얹는다
+    float lum0 = dot(g, kLumaRec709);
+    float pivot = 0.5f + P.splitBalance * 0.35f;
+    float hiW = smoothstep(pivot - 0.32f, min(pivot + 0.42f, 1.0f), lum0);
+    float shW = 1.0f - smoothstep(max(pivot - 0.45f, 0.0f), pivot + 0.28f, lum0);
+    g += float3(P.splitShadowR, P.splitShadowG, P.splitShadowB) * shW;
+    g += float3(P.splitHighR, P.splitHighG, P.splitHighB) * hiW;
+    g = max(g, 0.0f);
+
+    // (o) 채도 / 생동감
     float lum = dot(g, kLumaRec709);
     float mx = max(max(g.r, g.g), g.b);
     float mn = min(min(g.r, g.g), g.b);
@@ -459,6 +368,7 @@ kernel void tone_color(texture2d<float, access::read>   src      [[texture(0)]],
         float ratio = (g.g - g.b) / (g.r - g.b);
         skin = saturate(1.0f - 3.2f * abs(ratio - 0.55f));
     }
+    skin *= clamp(P.skinProtect, 0.0f, 1.0f);
     float vib = P.vibrance * (1.0f - sat * sat) * (1.0f - 0.6f * skin);
     g = mix(float3(lum), g, clamp(1.0f + vib + P.saturation, 0.0f, 3.0f));
 
@@ -651,6 +561,19 @@ kernel void finish(texture2d<float, access::sample> src [[texture(0)]],
         c.b = src.sample(kLinear, 0.5f + (uv - 0.5f) * (1.0f - k)).b;
     } else {
         c = src.sample(kLinear, uv).rgb;
+    }
+
+    // 코마 수차 — 주변부에서 점광원이 방사 방향으로 번진다 (밝은 렌즈의 실제 특성).
+    // 중심은 전혀 건드리지 않고 r^3 로 커진다.
+    if (P.coma > 0.001f && rad > 0.25f) {
+        float amount = P.coma * pow(saturate((rad - 0.25f) / 0.75f), 3.0f);
+        float2 dir = (rad > 1e-4f) ? (e / rad) : float2(0.0f);
+        float3 smear = 0.0f;
+        for (int i = 1; i <= 4; ++i) {
+            float t = float(i) / 4.0f;
+            smear += src.sample(kLinear, uv + dir * (t * amount * 0.016f)).rgb;
+        }
+        c = mix(c, smear * 0.25f, saturate(amount * 0.8f));
     }
 
     // 비네팅 (부드러운 코사인 4제곱 느낌)

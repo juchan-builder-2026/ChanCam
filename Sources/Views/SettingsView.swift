@@ -4,45 +4,43 @@ struct SettingsView: View {
     @EnvironmentObject private var store: ShotStore
     @EnvironmentObject private var processor: Processor
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject var camera: Camera
+
     @State private var confirmPurge = false
+    @State private var showSensor = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("내보내기 크기", selection: Binding(
-                        get: { processor.exportSize },
-                        set: { processor.exportSize = $0 })) {
-                        ForEach(ExportSize.allCases) { size in
-                            VStack(alignment: .leading) {
-                                Text(size.title)
-                                Text(size.detail).font(.caption).foregroundStyle(.secondary)
-                            }
-                            .tag(size)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
-                } header: {
-                    Text("내보내기 크기")
-                } footer: {
-                    Text("아이폰 48MP 센서는 네 화소를 하나로 묶는 방식이라, 실제로 분해되는 해상도는 24MP 쪽에 가까워요. 24MP가 화질과 용량의 균형점이고 a7 III와 같은 화소예요.")
-                }
-
-                Section {
-                    Toggle("촬영 후 자동 현상", isOn: $store.autoExport)
-                    Toggle("사진 앱에도 저장", isOn: $store.saveToPhotos)
-                    HStack {
-                        Text("JPEG 품질")
-                        Spacer()
-                        Text("\(Int(store.jpegQuality * 100))")
-                            .monospacedDigit().foregroundStyle(.secondary)
-                    }
-                    Slider(value: $store.jpegQuality, in: 0.7...1.0, step: 0.01)
+                    LabeledContent("현재 등급", value: processor.recipe.tier.name)
+                    LabeledContent("출력 해상도", value: "\(processor.recipe.outputSize)MP")
+                    LabeledContent("지시서", value: processor.recipe.summary)
+                        .font(.caption)
                 } header: {
                     Text("현상")
                 } footer: {
-                    Text("자동 현상을 켜면 셔터를 누른 뒤 백그라운드에서 바로 현상돼요. 꺼두면 보관함에서 원하는 사진만 골라 현상할 수 있어요.")
+                    Text("현상은 자동으로 돌지 않아요. 촬영 화면 아래 '현상 N장' 버튼이나 보관함에서 시작하면, 그 화면에서 품질과 옵션을 고르고 진행률·CPU·GPU·메모리를 보면서 돌려요.")
+                }
+
+                Section {
+                    Button {
+                        showSensor = true
+                    } label: {
+                        Label("센서 테스터 열기", systemImage: "waveform.badge.magnifyingglass")
+                    }
+                    if processor.gpuScore > 0 {
+                        LabeledContent("측정된 GPU 처리량",
+                                       value: String(format: "%.1f G탭/초", processor.gpuScore / 1e9))
+                    }
+                    LabeledContent("활성 카메라", value: camera.capabilities.deviceName)
+                    LabeledContent("깊이 스트림",
+                                   value: camera.capabilities.streamingDepth ? "사용 중" : "사용 안 함")
+                    LabeledContent("깊이 프레임", value: "\(camera.depthFrames)")
+                } header: {
+                    Text("하드웨어")
+                } footer: {
+                    Text("센서 테스터는 이 기기의 카메라·GPU·신경망 능력을 하드웨어에 직접 물어봐서 보여줘요. LiDAR 깊이가 실제로 흐르고 있는지도 거기서 확인할 수 있어요.")
                 }
 
                 Section {
@@ -56,6 +54,11 @@ struct SettingsView: View {
                         Text("남은 공간")
                         Spacer()
                         Text(store.freeText).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("현상 대기")
+                        Spacer()
+                        Text("\(store.undeveloped.count)장").monospacedDigit().foregroundStyle(.secondary)
                     }
                     Button(role: .destructive) {
                         confirmPurge = true
@@ -72,6 +75,7 @@ struct SettingsView: View {
                     LabeledContent("버전",
                                    value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
                     LabeledContent("기본 프로파일", value: "Chan")
+                    LabeledContent("현상 엔진", value: "레이트레이싱 + 신경망")
                 } footer: {
                     Text("기본 프로파일 'Chan'은 a7 III + FE 50mm F1.8로 찍은 사진 171장의 Lightroom 보정값 평균이에요. 하이라이트 −75 · 섀도우 +55 · 생동감 +12.")
                 }
@@ -81,6 +85,7 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("완료") { dismiss() } }
             }
+            .sheet(isPresented: $showSensor) { SensorTestView(camera: camera) }
             .confirmationDialog("현상이 끝난 사진의 원본 RAW를 모두 지울까요?",
                                 isPresented: $confirmPurge, titleVisibility: .visible) {
                 Button("원본 RAW 삭제", role: .destructive) { store.purgeExportedRaws() }

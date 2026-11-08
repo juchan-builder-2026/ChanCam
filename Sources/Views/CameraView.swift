@@ -10,6 +10,8 @@ struct CameraView: View {
     @State private var focusPoint: CGPoint?
     @State private var exposureBias: Float = 0
     @State private var showSettings = false
+    @State private var showSensor = false
+    @State private var developTargets: [Shot] = []
     @AppStorage("capturePreset") private var presetIndex = 0
 
     private var isDemo: Bool { ProcessInfo.processInfo.arguments.contains("-demo") }
@@ -43,14 +45,14 @@ struct CameraView: View {
             .padding(.bottom, 18)
         }
         .animation(.easeOut(duration: 0.12), value: camera.flashOverlay)
-        .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showSettings) { SettingsView(camera: camera) }
+        .sheet(isPresented: $showSensor) { SensorTestView(camera: camera) }
+        .sheet(isPresented: Binding(get: { !developTargets.isEmpty },
+                                    set: { if !$0 { developTargets = [] } })) {
+            DevelopView(shots: developTargets)
+        }
         .onAppear {
-            if !isDemo {
-                camera.onShot = { shot in
-                    if store.autoExport { processor.enqueue(shot) }
-                }
-                camera.start()
-            }
+            if !isDemo { camera.start() }
         }
         .onDisappear { camera.stop() }
     }
@@ -73,8 +75,16 @@ struct CameraView: View {
 
             Spacer()
 
-            if processor.queueCount > 0 || processor.jobs.values.contains(where: { $0.isActive }) {
+            if processor.isDeveloping {
                 ProcessingPill()
+            }
+
+            Button { showSensor = true } label: {
+                Image(systemName: "waveform.badge.magnifyingglass")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(.black.opacity(0.42)))
             }
 
             Button { showSettings = true } label: {
@@ -106,6 +116,24 @@ struct CameraView: View {
                 .background(Capsule().fill(.black.opacity(0.4)))
 
                 Spacer()
+
+                let waiting = store.undeveloped
+                if !waiting.isEmpty, !processor.isDeveloping {
+                    Button {
+                        developTargets = waiting
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "wand.and.rays")
+                            Text("현상 \(waiting.count)장")
+                        }
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(.yellow))
+                    }
+                    .buttonStyle(.plain)
+                }
 
                 HStack(spacing: 6) {
                     Image(systemName: "externaldrive")
@@ -230,21 +258,19 @@ struct PresetStrip: View {
 struct ProcessingPill: View {
     @EnvironmentObject private var processor: Processor
 
-    private var active: JobState? {
-        processor.jobs.values.first { $0.isActive }
-    }
-
     var body: some View {
         HStack(spacing: 7) {
             ProgressView().controlSize(.mini).tint(.yellow)
-            Text(active?.label ?? "대기 중")
-                .font(.system(size: 11, weight: .medium, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-            if processor.queueCount > 0 {
-                Text("+\(processor.queueCount)")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.yellow)
+            if let batch = processor.batch {
+                Text("\(batch.stage) \(Int(batch.overall * 100))%")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white)
+                if batch.total > 1 {
+                    Text("\(batch.finished + 1)/\(batch.total)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.yellow)
+                }
             }
         }
         .padding(.horizontal, 11)

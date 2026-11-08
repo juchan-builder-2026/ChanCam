@@ -13,12 +13,27 @@ struct DevelopSettings: Codable, Equatable {
     var whites: Float = 25         // -100 ... +100
     var blacks: Float = -20        // -100 ... +100
 
+    /// 디헤이즈 — 다크 채널 프라이어로 투과율을 추정해 대기광을 역산한다.
+    /// 음수면 반대로 안개를 더한다. -100 ... +100
+    var dehaze: Float = 0
+    /// 중역 로컬 대비. 다중 스케일 분해의 중간 밴드 게인. -100 ... +100
+    var localContrast: Float = 0
+
     // MARK: 색
     /// 켈빈. 0 이면 촬영 당시(As Shot) 값을 그대로 쓴다.
     var temperature: Float = 0     // 2000 ... 12000
     var tint: Float = 0            // -150 ... +150
     var vibrance: Float = 12       // -100 ... +100
     var saturation: Float = 2      // -100 ... +100
+    /// 생동감을 올릴 때 살색을 얼마나 지킬지. 0 ... 100
+    var skinProtect: Float = 100
+
+    // MARK: 색 분리 (스플릿 토닝)
+    var splitShadowHue: Float = 215   // 0 ... 360
+    var splitShadowSat: Float = 0     // 0 ... 100
+    var splitHighHue: Float = 45      // 0 ... 360
+    var splitHighSat: Float = 0       // 0 ... 100
+    var splitBalance: Float = 0       // -100 ... +100
 
     // MARK: 디테일
     var texture: Float = 0         // -100 ... +100
@@ -46,12 +61,30 @@ struct DevelopSettings: Codable, Equatable {
     var catsEye: Float = 0.6       // 0 ... 1
     /// 보케 볼 가장자리 강조 (구면수차). 0 = 평평, 1 = 링 보케
     var bokehRing: Float = 0.15    // 0 ... 1
+    /// 아포다이제이션 — 조리개 가장자리 투과율을 떨군다. 소니 STF 렌즈의 그 효과.
+    /// 보케 경계가 솜처럼 부드러워진다. 0 ... 1
+    var apodization: Float = 0.18
+    /// 종방향 색수차 — 파장별로 초점면이 다르다. 밝은 렌즈의 실제 특성.
+    var longitudinalCA: Float = 0.06  // 0 ... 0.4
+    /// 조리개 회전 (도). 다각형 보케와 회절 스파이크의 방향.
+    var apertureRotation: Float = 0   // 0 ... 90
+
+    // MARK: 광원 추적 (렌즈 플레어)
+    /// 전체 세기. 0 이면 광원 추적 단계를 아예 건너뛴다.
+    var flare: Float = 0           // 0 ... 100
+    var ghostCount: Float = 5      // 0 ... 8
+    var ghostStrength: Float = 55  // 0 ... 100
+    var haloStrength: Float = 35   // 0 ... 100
+    var glareStrength: Float = 40  // 0 ... 100 (베일링 글레어)
+    var spikeStrength: Float = 60  // 0 ... 100 (회절 스파이크)
 
     // MARK: 마무리
     var vignette: Float = -2       // -100 ... +100
     var grain: Float = 0           // 0 ... 100
     var grainSize: Float = 1.0     // 0.5 ... 3
     var chromaticAberration: Float = 0 // 0 ... 100
+    /// 코마 수차 — 주변부에서 점광원이 방사 방향으로 번진다. 0 ... 100
+    var coma: Float = 0
 
     // MARK: 지오메트리
     var rotation: Float = 0        // -45 ... +45 도
@@ -65,6 +98,10 @@ struct DevelopSettings: Codable, Equatable {
         var s = DevelopSettings()
         s.contrast = 0; s.highlights = 0; s.shadows = 0; s.whites = 0; s.blacks = 0
         s.vibrance = 0; s.saturation = 0; s.sharpness = 0; s.vignette = 0
+        s.dehaze = 0; s.localContrast = 0
+        s.splitShadowSat = 0; s.splitHighSat = 0
+        s.flare = 0; s.coma = 0
+        s.apodization = 0; s.longitudinalCA = 0
         s.bokehEnabled = false
         return s
     }
@@ -122,6 +159,8 @@ struct DevelopSettings: Codable, Equatable {
         landscape.sharpenRadius = 0.8
         landscape.luminanceNR = 6
         landscape.colorNR = 18
+        landscape.dehaze = 22         // 먼 산의 대기 산란을 걷어낸다
+        landscape.localContrast = 18
         landscape.bokehEnabled = false
         landscape.vignette = -8
 
@@ -141,6 +180,12 @@ struct DevelopSettings: Codable, Equatable {
         night.highlightBloom = 1.7
         night.bokehRing = 0.28
         night.catsEye = 0.75
+        night.apodization = 0.08      // 밤엔 보케 볼이 또렷한 쪽이 낫다
+        night.longitudinalCA = 0.10
+        night.flare = 48              // 가로등·네온이 렌즈 안에서 하는 일
+        night.ghostCount = 6
+        night.spikeStrength = 70
+        night.glareStrength = 50
         night.vignette = -10
 
         // 필름: 블랙을 띄우고 하이라이트를 길게. Portra 계열 느낌.
@@ -160,6 +205,14 @@ struct DevelopSettings: Codable, Equatable {
         film.vignette = -20
         film.fNumber = 2.0
         film.highlightBloom = 1.3
+        film.apodization = 0.3        // 올드 렌즈의 뭉근한 보케
+        film.longitudinalCA = 0.14
+        film.flare = 30               // 코팅이 약한 올드 렌즈의 글로우
+        film.glareStrength = 65
+        film.ghostStrength = 35
+        film.spikeStrength = 20
+        film.coma = 18
+        film.dehaze = -8              // 아주 살짝 안개를 얹는다
 
         // 흑백: 중간톤 분리가 생명.
         var mono = DevelopSettings()
@@ -236,6 +289,7 @@ enum EditorGroup: String, CaseIterable, Identifiable {
     case color = "컬러"
     case detail = "디테일"
     case lens = "렌즈"
+    case optics = "광학"
     case effect = "효과"
 
     var id: String { rawValue }
@@ -246,7 +300,26 @@ enum EditorGroup: String, CaseIterable, Identifiable {
         case .color: return "paintpalette"
         case .detail: return "circle.grid.cross"
         case .lens: return "camera.aperture"
+        case .optics: return "rays"
         case .effect: return "wand.and.stars"
+        }
+    }
+
+    /// 이 그룹이 하는 일에 대한 한 줄 설명 — 슬라이더 이름만으론 뭔지 모를 것들
+    var note: String? {
+        switch self {
+        case .light:
+            return "하이라이트·섀도우는 다중 스케일 분해의 '넓은' 밴드에만 걸려요. 그래서 크게 올려도 평평해지지 않아요."
+        case .color:
+            return "생동감은 이미 채도가 낮은 색에만 들어가고, 살색은 따로 지켜요."
+        case .detail:
+            return "신경망 디테일 세기는 현상 시작 화면에서 고르세요. 여기 값들은 그 위에 더해지는 고전 샤프닝이에요."
+        case .lens:
+            return "조리개·초점 거리는 얇은 렌즈 공식으로 착란원을 계산해요. 실제 렌즈와 같은 숫자를 넣으면 같은 흐림이 나와요."
+        case .optics:
+            return "광원이 렌즈 안에서 반사·회절되며 만드는 것들이에요. 밝은 점광원이 화면에 있을 때만 보여요."
+        case .effect:
+            return nil
         }
     }
 
@@ -260,6 +333,8 @@ enum EditorGroup: String, CaseIterable, Identifiable {
                 Slider1D(name: "섀도우", range: -100...100, neutral: 0, key: \.shadows),
                 Slider1D(name: "화이트", range: -100...100, neutral: 0, key: \.whites),
                 Slider1D(name: "블랙", range: -100...100, neutral: 0, key: \.blacks),
+                Slider1D(name: "로컬 대비", range: -100...100, neutral: 0, key: \.localContrast),
+                Slider1D(name: "디헤이즈", range: -100...100, neutral: 0, key: \.dehaze),
             ]
         case .color:
             return [
@@ -267,6 +342,12 @@ enum EditorGroup: String, CaseIterable, Identifiable {
                 Slider1D(name: "색조", range: -150...150, neutral: 0, key: \.tint),
                 Slider1D(name: "생동감", range: -100...100, neutral: 0, key: \.vibrance),
                 Slider1D(name: "채도", range: -100...100, neutral: 0, key: \.saturation),
+                Slider1D(name: "살색 보호", range: 0...100, neutral: 100, key: \.skinProtect),
+                Slider1D(name: "섀도우 색조", range: 0...360, neutral: 215, key: \.splitShadowHue, step: 5, unit: "°"),
+                Slider1D(name: "섀도우 채도", range: 0...100, neutral: 0, key: \.splitShadowSat),
+                Slider1D(name: "하이라이트 색조", range: 0...360, neutral: 45, key: \.splitHighHue, step: 5, unit: "°"),
+                Slider1D(name: "하이라이트 채도", range: 0...100, neutral: 0, key: \.splitHighSat),
+                Slider1D(name: "분리 균형", range: -100...100, neutral: 0, key: \.splitBalance),
             ]
         case .detail:
             return [
@@ -283,9 +364,22 @@ enum EditorGroup: String, CaseIterable, Identifiable {
                 Slider1D(name: "초점 거리", range: 0...10, neutral: 0, key: \.focusDistance, step: 0.05, unit: "m"),
                 Slider1D(name: "환산 화각", range: 24...135, neutral: 50, key: \.focalLength, step: 1, unit: "mm"),
                 Slider1D(name: "조리개 곡률", range: 0...1, neutral: 1, key: \.bladeCurvature, step: 0.05),
+                Slider1D(name: "조리개 회전", range: 0...90, neutral: 0, key: \.apertureRotation, step: 1, unit: "°"),
+                Slider1D(name: "아포다이제이션", range: 0...1, neutral: 0, key: \.apodization, step: 0.02),
                 Slider1D(name: "하이라이트 블룸", range: 0...2, neutral: 1, key: \.highlightBloom, step: 0.05),
                 Slider1D(name: "고양이눈", range: 0...1, neutral: 0, key: \.catsEye, step: 0.05),
                 Slider1D(name: "링 보케", range: 0...1, neutral: 0, key: \.bokehRing, step: 0.05),
+                Slider1D(name: "종방향 색수차", range: 0...0.4, neutral: 0, key: \.longitudinalCA, step: 0.01),
+            ]
+        case .optics:
+            return [
+                Slider1D(name: "플레어 전체", range: 0...100, neutral: 0, key: \.flare),
+                Slider1D(name: "고스트 개수", range: 0...8, neutral: 5, key: \.ghostCount),
+                Slider1D(name: "고스트 세기", range: 0...100, neutral: 55, key: \.ghostStrength),
+                Slider1D(name: "헤일로", range: 0...100, neutral: 35, key: \.haloStrength),
+                Slider1D(name: "베일링 글레어", range: 0...100, neutral: 40, key: \.glareStrength),
+                Slider1D(name: "회절 스파이크", range: 0...100, neutral: 60, key: \.spikeStrength),
+                Slider1D(name: "코마 수차", range: 0...100, neutral: 0, key: \.coma),
             ]
         case .effect:
             return [

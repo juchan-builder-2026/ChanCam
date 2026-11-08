@@ -35,6 +35,7 @@ struct LibraryView: View {
     @State private var showOnlyFavorites = false
     @State private var confirmPurge = false
     @State private var purgeResult: String?
+    @State private var developTargets: [Shot] = []
 
     private var shown: [Shot] {
         showOnlyFavorites ? store.shots.filter(\.isFavorite) : store.shots
@@ -67,11 +68,12 @@ struct LibraryView: View {
                                                   systemImage: shot.isFavorite ? "heart.slash" : "heart")
                                         }
                                         Button {
-                                            processor.enqueue(shot)
+                                            developTargets = [shot]
                                         } label: {
-                                            Label("다시 현상", systemImage: "arrow.clockwise")
+                                            Label(shot.exportedAt == nil ? "현상하기" : "다시 현상",
+                                                  systemImage: "wand.and.rays")
                                         }
-                                        .disabled(!store.hasRaw(shot))
+                                        .disabled(!store.hasRaw(shot) || processor.isDeveloping)
                                         Divider()
                                         Button(role: .destructive) {
                                             ThumbCache.shared.drop(shot.id)
@@ -105,6 +107,20 @@ struct LibraryView: View {
                         Image(systemName: showOnlyFavorites ? "heart.fill" : "heart")
                     }
                 }
+                ToolbarItem(placement: .bottomBar) {
+                    let waiting = store.undeveloped
+                    Button {
+                        developTargets = waiting
+                    } label: {
+                        Label(waiting.isEmpty ? "현상 대기 없음" : "현상 안 된 \(waiting.count)장 현상",
+                              systemImage: "wand.and.rays")
+                    }
+                    .disabled(waiting.isEmpty || processor.isDeveloping)
+                }
+            }
+            .sheet(isPresented: Binding(get: { !developTargets.isEmpty },
+                                        set: { if !$0 { developTargets = [] } })) {
+                DevelopView(shots: developTargets)
             }
             .confirmationDialog("현상이 끝난 사진의 원본 RAW를 모두 지울까요?",
                                 isPresented: $confirmPurge, titleVisibility: .visible) {

@@ -2,6 +2,7 @@ import CoreImage
 import Foundation
 import Metal
 import Photos
+import QuartzCore
 import SwiftUI
 import UIKit
 import Vision
@@ -30,29 +31,105 @@ enum ExportSize: Int, CaseIterable, Identifiable {
     }
 }
 
-/// RAW 디코드 + 백그라운드 현상 큐.
+/// 취소 플래그 — 메인에서 올리고 작업 큐에서 읽는다
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+    func raise() { lock.lock(); value = true; lock.unlock() }
+    func clear() { lock.lock(); value = false; lock.unlock() }
+}
+
+/// 현상 한 번(한 장 또는 여러 장)의 진행 상태
+struct BatchProgress: Equatable {
+    var total = 0
+    var finished = 0
+    var failed = 0
+    var stage = "준비"
+    /// 지금 장의 진행률 0...1
+    var fraction: Double = 0
+    var startedAt = Date()
+    var endedAt: Date?
+    var isRunning = true
+    var cancelled = false
+    var currentName = ""
+    /// 끝난 장들의 실제 소요 시간 (남은 시간 추정용)
+    var completedSeconds: [Double] = []
+
+    var overall: Double {
+        guard total > 0 else { return 0 }
+        return min((Double(finished) + fraction) / Double(total), 1)
+    }
+
+    var elapsed: TimeInterval {
+        (endedAt ?? Date()).timeIntervalSince(startedAt)
+    }
+
+    /// 남은 시간 — 실제로 끝난 장들의 평균으로 추정한다 (추측이 아니라 실측 기반)
+    var remaining: TimeInterval? {
+        guard isRunning, total > 0 else { return nil }
+        let done = Double(finished) + fraction
+        guard done > 0.08 else { return nil }
+        let perUnit = elapsed / done
+        return max(perUnit * (Double(total) - done), 0)
+    }
+
+    var isComplete: Bool { !isRunning && !cancelled }
+}
+
+/// RAW 디코드 + 현상 실행기.
+///
+/// v1.2 부터 현상은 **자동으로 돌지 않는다**. 사용자가 현상 화면에서 품질과 옵션을
+/// 고르고 시작을 누를 때만 돈다. 진행률은 가짜 애니메이션이 아니라 단계마다
+/// 실제로 끊어 쏘는 GPU 명령 버퍼의 완료를 세어서 올린다.
 @MainActor
 final class Processor: ObservableObject {
     static let shared = Processor()
 
     @Published private(set) var jobs: [UUID: JobState] = [:]
-    @Published private(set) var queueCount = 0
+    @Published private(set) var batch: BatchProgress?
     @Published var lastError: String?
 
-    @AppStorage("exportSize") private var exportSizeRaw = ExportSize.mp24.rawValue
+    /// 현상 지시서 — UserDefaults 에 JSON 으로 저장된다
+    @Published var recipe: DevelopRecipe {
+        didSet { saveRecipe() }
+    }
+
+    /// 벤치마크로 실측한 GPU 점수 (탭/초). 예상 시간 계산에 쓴다.
+    @AppStorage("gpuScore") var gpuScore: Double = 0
+
     var exportSize: ExportSize {
-        get { ExportSize(rawValue: exportSizeRaw) ?? .mp24 }
-        set { exportSizeRaw = newValue.rawValue }
+        get { ExportSize(rawValue: recipe.outputSize) ?? .mp24 }
+        set { recipe.outputSize = newValue.rawValue }
     }
 
     private let renderer = Renderer.shared
     private let work = DispatchQueue(label: "com.chan.cam.develop", qos: .userInitiated)
-    private var pending: [UUID] = []
-    private var isRunning = false
+    private let flag = CancelFlag()
+    private var running = false
 
     /// 편집 화면용 디코드 캐시. 슬라이더를 움직일 때마다 RAW 를 다시 디코드하면
     /// 1~2초씩 걸린다. 한 번 디코드해 두면 이후엔 GPU 현상만 돌아 즉각 반응한다.
     private let cache = InputCache()
+
+    private static let recipeKey = "developRecipe"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: Processor.recipeKey),
+           let saved = try? JSONDecoder().decode(DevelopRecipe.self, from: data) {
+            recipe = saved
+        } else {
+            recipe = .default
+        }
+    }
+
+    private func saveRecipe() {
+        guard let data = try? JSONEncoder().encode(recipe) else { return }
+        UserDefaults.standard.set(data, forKey: Processor.recipeKey)
+    }
 
     final class InputCache: @unchecked Sendable {
         private let lock = NSLock()
@@ -75,11 +152,12 @@ final class Processor: ObservableObject {
 
     func dropCache() { cache.clear() }
 
-    // MARK: - 인물 분리 (Vision)
+    // MARK: - 피사체 분리 (Vision)
 
     /// 48MP ProRAW 와 사진 깊이 전달을 같이 못 쓰기 때문에 애플 인물 매트는 안 온다.
-    /// 대신 현상할 때 Vision 으로 사람 영역을 뽑는다. 머리카락 경계가 깊이맵보다 훨씬 정확해서
-    /// 보케 경계를 다듬는 데 쓴다. 결과는 파일로 캐시한다.
+    /// 대신 현상할 때 Vision 으로 피사체를 뽑는다. iOS 17 의 전경 인스턴스 분리는
+    /// 사람뿐 아니라 물체도 잡고, 머리카락 경계가 깊이맵보다 훨씬 정확하다.
+    /// 결과는 파일로 캐시한다.
     nonisolated static func personMatte(previewURL: URL, cacheURL: URL) -> CIImage? {
         if FileManager.default.fileExists(atPath: cacheURL.path) {
             return CIImage(contentsOf: cacheURL)
@@ -87,44 +165,70 @@ final class Processor: ObservableObject {
         guard let source = CIImage(contentsOf: previewURL, options: [.applyOrientationProperty: true])
         else { return nil }
 
-        let request = VNGeneratePersonSegmentationRequest()
-        request.qualityLevel = .accurate
-        request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-
         let context = CIContext(options: [.cacheIntermediates: false])
-        let handler = VNImageRequestHandler(ciImage: source, options: [:])
-        guard (try? handler.perform([request])) != nil,
-              let buffer = (request.results as [VNPixelBufferObservation]?)?.first?.pixelBuffer
-        else { return nil }
+        var matte: CIImage?
 
-        // 사람이 없으면 전부 0 이 나온다 — 그럴 땐 쓰지 않는다
-        guard Processor.hasContent(buffer) else { return nil }
+        // 1순위 — 전경 인스턴스 분리 (애플이 학습시킨 피사체 분리 모델)
+        if #available(iOS 17.0, *) {
+            let request = VNGenerateForegroundInstanceMaskRequest()
+            let handler = VNImageRequestHandler(ciImage: source, options: [:])
+            if (try? handler.perform([request])) != nil,
+               let observation = request.results?.first,
+               !observation.allInstances.isEmpty,
+               let buffer = try? observation.generateScaledMaskForImage(
+                    forInstances: observation.allInstances, from: handler),
+               Processor.hasContent(buffer, floatMask: true) {
+                matte = CIImage(cvPixelBuffer: buffer)
+            }
+        }
 
-        var matte = CIImage(cvPixelBuffer: buffer)
+        // 2순위 — 사람 분리
+        if matte == nil {
+            let request = VNGeneratePersonSegmentationRequest()
+            request.qualityLevel = .accurate
+            request.outputPixelFormat = kCVPixelFormatType_OneComponent8
+            let handler = VNImageRequestHandler(ciImage: source, options: [:])
+            if (try? handler.perform([request])) != nil,
+               let buffer = (request.results as [VNPixelBufferObservation]?)?.first?.pixelBuffer,
+               Processor.hasContent(buffer, floatMask: false) {
+                matte = CIImage(cvPixelBuffer: buffer)
+            }
+        }
+
+        guard var result = matte else { return nil }
         // 원본 비율에 맞춰 늘린다
-        let sx = source.extent.width / max(matte.extent.width, 1)
-        let sy = source.extent.height / max(matte.extent.height, 1)
-        matte = matte.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-        if let data = context.jpegRepresentation(of: matte,
+        let sx = source.extent.width / max(result.extent.width, 1)
+        let sy = source.extent.height / max(result.extent.height, 1)
+        result = result.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        if let data = context.jpegRepresentation(of: result,
                                                  colorSpace: CGColorSpaceCreateDeviceGray(),
                                                  options: [:]) {
             try? data.write(to: cacheURL, options: .atomic)
         }
-        return matte
+        return result
     }
 
-    /// 매트가 전부 검정인지 (= 사람 없음) 빠르게 확인
-    nonisolated static func hasContent(_ buffer: CVPixelBuffer) -> Bool {
+    /// 매트가 전부 비어 있는지 (= 피사체 없음) 빠르게 확인
+    nonisolated static func hasContent(_ buffer: CVPixelBuffer, floatMask: Bool) -> Bool {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return false }
         let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+        guard w > 4, h > 4 else { return false }
         let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let isFloat = floatMask && format == kCVPixelFormatType_OneComponent32Float
         var lit = 0
         let step = max(min(w, h) / 48, 1)
         for y in stride(from: 0, to: h, by: step) {
-            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
-            for x in stride(from: 0, to: w, by: step) where row[x] > 140 { lit += 1 }
+            let row = base.advanced(by: y * rowBytes)
+            if isFloat {
+                let values = row.assumingMemoryBound(to: Float.self)
+                for x in stride(from: 0, to: w, by: step) where values[x] > 0.55 { lit += 1 }
+            } else {
+                let values = row.assumingMemoryBound(to: UInt8.self)
+                for x in stride(from: 0, to: w, by: step) where values[x] > 140 { lit += 1 }
+            }
         }
         return lit > 12
     }
@@ -134,6 +238,14 @@ final class Processor: ObservableObject {
         guard iso > 0 else { return 0.08 }
         let stops = log2(max(iso, 50) / 100)          // ISO100 기준 스톱 수
         return min(max(0.05 + stops * 0.085, 0.05), 0.62)
+    }
+
+    /// 선형 장면값 기준 노이즈 바닥 추정. 신경망 블록의 셰이프 임계가 된다.
+    /// 읽기 노이즈는 신호의 제곱근에 비례하므로 ISO 의 제곱근으로 올린다.
+    nonisolated static func noiseFloor(iso: Float) -> Float {
+        let base: Float = 0.0022
+        let scale = sqrt(max(iso, 50) / 100)
+        return min(max(base * scale, 0.0015), 0.06)
     }
 
     // MARK: - 디코드
@@ -171,10 +283,14 @@ final class Processor: ObservableObject {
 
     /// 현상에 필요한 입력 일체를 준비
     nonisolated func makeInput(shot: Shot, rawURL: URL, depth: DepthMap?, matteImage: CIImage?,
-                               targetLongSide: Int) throws -> Renderer.Input {
+                               targetLongSide: Int, bokehSide: Int,
+                               analyze: Bool,
+                               publish: (String, Double) -> Void = { _, _ in }) throws -> Renderer.Input {
         let fullLong = max(shot.pixelWidth, shot.pixelHeight)
         let scale = fullLong > 0 ? min(Float(targetLongSide) / Float(fullLong), 1) : 1
+        publish("decode", 0.15)
         let image = try decode(url: rawURL, scale: scale)
+        publish("decode", 0.7)
 
         let extent = image.extent
         var width = Int(extent.width.rounded())
@@ -191,13 +307,14 @@ final class Processor: ObservableObject {
         guard let linear = renderer?.linearTexture(image, width: width, height: height) else {
             throw RenderError.allocation
         }
+        publish("decode", 1)
         var depthTexture: MTLTexture?
         if let depth { depthTexture = renderer?.depthTexture(depth) }
         var matteTexture: MTLTexture?
         if let matteImage {
             // 매트는 보케 작업 해상도 정도면 충분하다 (uv 로 샘플링하므로 크기 자유)
             let long = max(width, height)
-            let k = min(Double(Renderer.bokehLongSide) / Double(max(long, 1)), 1)
+            let k = min(Double(bokehSide) / Double(max(long, 1)), 1)
             let mw = max(Int(Double(width) * k), 64), mh = max(Int(Double(height) * k), 64)
             matteTexture = renderer?.grayTexture(matteImage, width: mw, height: mh)
         }
@@ -208,21 +325,30 @@ final class Processor: ObservableObject {
         var input = Renderer.Input(linear: linear, depth: depthTexture, matte: matteTexture,
                                    focusDistance: focus)
         // 장면 분석 — 사진마다 노출·블랙·화이트를 따로 잡는다
-        input.auto = renderer?.analyze(linear) ?? .neutral
+        publish("analyze", 0)
+        input.auto = analyze ? (renderer?.analyze(linear) ?? .neutral) : .neutral
         input.autoNR = Processor.autoNoise(iso: shot.iso)
+        input.noiseFloor = Processor.noiseFloor(iso: shot.iso)
+        publish("analyze", 1)
         return input
     }
 
     /// 현상에 쓸 입력 한 벌 (매트 생성 포함). work 큐에서만 부른다.
-    nonisolated private func prepare(shot: Shot, paths: Paths, targetLongSide: Int,
-                                     needsMatte: Bool) throws -> Renderer.Input {
+    nonisolated private func prepare(shot: Shot, paths: Paths, recipe: DevelopRecipe,
+                                     targetLongSide: Int, needsMatte: Bool,
+                                     publish: (String, Double) -> Void = { _, _ in })
+        throws -> Renderer.Input {
         let depth = paths.depth.flatMap { try? Data(contentsOf: $0) }.flatMap(DepthMap.decode)
         var matte: CIImage?
         if needsMatte, depth != nil, let preview = paths.preview {
+            publish("mask", 0)
             matte = Processor.personMatte(previewURL: preview, cacheURL: paths.matteCache)
+            publish("mask", 1)
         }
         return try makeInput(shot: shot, rawURL: paths.raw, depth: depth,
-                             matteImage: matte, targetLongSide: targetLongSide)
+                             matteImage: matte, targetLongSide: targetLongSide,
+                             bokehSide: recipe.bokehSide, analyze: recipe.sceneAnalysis,
+                             publish: publish)
     }
 
     /// MainActor 에서 미리 뽑아 두는 경로 묶음 (work 큐는 ShotStore 를 못 만진다)
@@ -247,20 +373,31 @@ final class Processor: ObservableObject {
 
     // MARK: - 미리보기 (편집 화면용, 즉시)
 
+    /// 편집 화면은 반응 속도가 생명이라 샘플 수를 줄인 가벼운 지시서를 쓴다.
+    /// 그림의 성격은 같고 보케 디스크만 조금 거칠다.
+    private var previewRecipe: DevelopRecipe {
+        var light = recipe
+        light.apertureSamples = min(recipe.apertureSamples, 16)
+        light.marchSteps = min(recipe.marchSteps, 12)
+        light.neuralScales = min(recipe.neuralScales, 2)
+        return light
+    }
+
     func preview(shot: Shot, settings: DevelopSettings, longSide: Int = 2000) async -> CGImage? {
         guard let renderer, let paths = paths(for: shot, useExportAsSource: true) else { return nil }
+        let light = previewRecipe
         let key = "\(shot.id.uuidString)-\(longSide)"
-        let wantsMatte = settings.bokehEnabled
+        let wantsMatte = settings.bokehEnabled && light.subjectMask
         return await withCheckedContinuation { continuation in
             work.async {
                 do {
                     var input = self.cache.lookup(key)
                     if input == nil || (wantsMatte && input?.matte == nil) {
-                        input = try self.prepare(shot: shot, paths: paths,
+                        input = try self.prepare(shot: shot, paths: paths, recipe: light,
                                                  targetLongSide: longSide, needsMatte: wantsMatte)
                         self.cache.store(key, input!)
                     }
-                    let result = try renderer.develop(input!, settings)
+                    let result = try renderer.develop(input!, settings, recipe: light)
                     continuation.resume(returning: renderer.cgImage(from: result))
                 } catch {
                     continuation.resume(returning: nil)
@@ -269,76 +406,136 @@ final class Processor: ObservableObject {
         }
     }
 
-    // MARK: - 백그라운드 현상 큐
+    // MARK: - 현상 실행 (수동 시작)
 
-    func enqueue(_ shot: Shot) {
-        guard jobs[shot.id]?.isActive != true else { return }
-        jobs[shot.id] = .queued
-        pending.append(shot.id)
-        queueCount = pending.count
-        runNext()
-    }
+    var isDeveloping: Bool { batch?.isRunning == true }
 
-    func cancelAll() {
-        pending.removeAll()
-        queueCount = 0
-        for (key, value) in jobs where value == .queued {
-            jobs[key] = nil
+    /// 현상 화면의 '시작' 버튼이 부르는 유일한 입구.
+    func start(_ shots: [Shot]) {
+        guard !running, !shots.isEmpty else { return }
+        guard renderer != nil else {
+            lastError = "GPU를 쓸 수 없어요"
+            return
         }
+        flag.clear()
+        running = true
+        var progress = BatchProgress()
+        progress.total = shots.count
+        progress.stage = "시작"
+        batch = progress
+        for shot in shots { jobs[shot.id] = .queued }
+        SystemMonitor.shared.reset()
+        SystemMonitor.shared.start()
+
+        Task { await runBatch(shots) }
     }
 
-    private func runNext() {
-        guard !isRunning, !pending.isEmpty else { return }
-        isRunning = true
-        let id = pending.removeFirst()
-        queueCount = pending.count
-        Task {
-            await export(id)
-            self.isRunning = false
-            self.runNext()
+    func cancel() {
+        flag.raise()
+        batch?.cancelled = true
+        batch?.stage = "취소 중"
+    }
+
+    /// 현상이 끝난 뒤 결과 화면을 닫을 때
+    func clearBatch() {
+        guard batch?.isRunning != true else { return }
+        batch = nil
+        SystemMonitor.shared.stop()
+    }
+
+    private func runBatch(_ shots: [Shot]) async {
+        for shot in shots {
+            if flag.isSet { break }
+            batch?.currentName = shot.date.formatted(date: .omitted, time: .standard)
+            batch?.fraction = 0
+            let began = Date()
+            let ok = await develop(shot)
+            if flag.isSet { break }
+            batch?.completedSeconds.append(Date().timeIntervalSince(began))
+            batch?.finished += 1
+            batch?.fraction = 0
+            if !ok { batch?.failed += 1 }
         }
+        running = false
+        batch?.isRunning = false
+        batch?.endedAt = Date()
+        batch?.stage = flag.isSet ? "취소됨" : "완료"
+        batch?.fraction = flag.isSet ? 0 : 1
+        if flag.isSet {
+            for (id, state) in jobs where state == .queued { jobs[id] = nil }
+        }
+        SystemMonitor.shared.stop()
     }
 
-    private func export(_ id: UUID) async {
+    @discardableResult
+    private func develop(_ shot: Shot) async -> Bool {
         let store = ShotStore.shared
-        guard let shot = store.shots.first(where: { $0.id == id }) else {
-            jobs[id] = nil
-            return
-        }
-        guard let renderer else {
-            jobs[id] = .failed("GPU를 쓸 수 없어요")
-            return
-        }
-        guard store.rawURL(shot) != nil, let paths = paths(for: shot) else {
-            jobs[id] = .failed("원본이 없어요")
-            return
+        guard let renderer else { return false }
+        let current = store.shots.first(where: { $0.id == shot.id }) ?? shot
+        guard store.rawURL(current) != nil, let paths = paths(for: current) else {
+            jobs[shot.id] = .failed("원본이 없어요")
+            return false
         }
 
-        jobs[id] = .running(stage: "RAW 디코드", progress: 0.05)
-        let settings = shot.develop
-        let target = exportSize.longSide
-        let quality = store.jpegQuality
+        let id = current.id
+        let settings = current.develop
+        let activeRecipe = recipe
+        let hasDepth = paths.depth != nil && settings.bokehEnabled
+        let plan = DevelopStage.plan(activeRecipe, hasDepth: hasDepth)
+        let target = activeRecipe.longSide
+        let quality = activeRecipe.jpegQuality
         let folder = paths.folder
+        let needsMatte = hasDepth && activeRecipe.subjectMask
+        let cancelFlag = flag
 
-        let result: Result<(String, Int, Int), Error> = await withCheckedContinuation { continuation in
+        jobs[id] = .running(stage: "RAW 디코드", progress: 0.01)
+
+        let result: Result<String, Error> = await withCheckedContinuation { continuation in
             work.async {
+                // 단계 키 → 전체 진행률. 이 지시서에 없는 단계는 보고하지 않는다
+                // (모르는 키를 1.0 으로 처리하면 진행률이 튄다)
+                let totalWeight = plan.reduce(0.0) { $0 + $1.weight }
+                func globalFraction(_ key: String, _ local: Double) -> (String, Double)? {
+                    var before = 0.0
+                    for stage in plan {
+                        if stage.key == key {
+                            let clamped = min(max(local, 0), 1)
+                            return (stage.name, (before + stage.weight * clamped) / totalWeight)
+                        }
+                        before += stage.weight
+                    }
+                    return nil
+                }
+                var lastPublished = CACurrentMediaTime() - 1
+                func publish(_ key: String, _ local: Double) {
+                    guard let (name, fraction) = globalFraction(key, local) else { return }
+                    let now = CACurrentMediaTime()
+                    guard local >= 1 || local <= 0 || now - lastPublished > 0.07 else { return }
+                    lastPublished = now
+                    Task { @MainActor in
+                        self.jobs[id] = .running(stage: name, progress: fraction)
+                        self.batch?.stage = name
+                        self.batch?.fraction = fraction
+                    }
+                }
+
                 do {
-                    let input = try self.prepare(shot: shot, paths: paths, targetLongSide: target,
-                                                 needsMatte: settings.bokehEnabled)
-                    Task { @MainActor in
-                        self.jobs[id] = .running(stage: settings.bokehEnabled ? "보케 계산" : "현상",
-                                                 progress: 0.35)
-                    }
-                    let texture = try renderer.develop(input, settings)
-                    Task { @MainActor in
-                        self.jobs[id] = .running(stage: "저장", progress: 0.85)
-                    }
+                    let input = try self.prepare(shot: current, paths: paths, recipe: activeRecipe,
+                                                 targetLongSide: target, needsMatte: needsMatte,
+                                                 publish: { key, local in publish(key, local) })
+                    if cancelFlag.isSet { throw RenderError.cancelled }
+
+                    let texture = try renderer.develop(input, settings, recipe: activeRecipe,
+                                                       report: { key, local in publish(key, local) },
+                                                       cancelled: { cancelFlag.isSet })
+                    publish("encode", 0.1)
                     guard let data = renderer.jpegData(from: texture, quality: CGFloat(quality)) else {
                         throw RenderError.decode("JPEG 인코딩 실패")
                     }
                     let name = "export.jpg"
                     try data.write(to: folder.appendingPathComponent(name), options: .atomic)
-                    continuation.resume(returning: .success((name, texture.width, texture.height)))
+                    publish("encode", 1)
+                    continuation.resume(returning: .success(name))
                 } catch {
                     continuation.resume(returning: .failure(error))
                 }
@@ -346,15 +543,23 @@ final class Processor: ObservableObject {
         }
 
         switch result {
-        case .success(let (name, _, _)):
-            store.markExported(id, file: name)
+        case .success(let name):
+            store.markExported(id, file: name, keepRaw: activeRecipe.keepRaw)
             jobs[id] = .done
-            if store.saveToPhotos, let url = store.exportURL(shot) {
+            ThumbCache.shared.drop(id)
+            if activeRecipe.saveToPhotos, let shot = store.shots.first(where: { $0.id == id }),
+               let url = store.exportURL(shot) {
                 await saveToPhotos(url)
             }
+            return true
         case .failure(let error):
-            jobs[id] = .failed(error.localizedDescription)
-            lastError = error.localizedDescription
+            if case RenderError.cancelled = error {
+                jobs[id] = nil
+            } else {
+                jobs[id] = .failed(error.localizedDescription)
+                lastError = error.localizedDescription
+            }
+            return false
         }
     }
 
@@ -370,4 +575,9 @@ final class Processor: ObservableObject {
     }
 
     func state(_ id: UUID) -> JobState? { jobs[id] }
+
+    /// 아직 현상하지 않은 사진들
+    func pending(_ shots: [Shot]) -> [Shot] {
+        shots.filter { $0.exportedAt == nil && ShotStore.shared.hasRaw($0) }
+    }
 }
