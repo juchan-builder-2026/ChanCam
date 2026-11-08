@@ -12,6 +12,7 @@ struct CameraView: View {
     @State private var showSettings = false
     @State private var showSensor = false
     @State private var developTargets: [Shot] = []
+    @State private var pinchBase: CGFloat = 1
     @AppStorage("capturePreset") private var presetIndex = 0
 
     private var isDemo: Bool { ProcessInfo.processInfo.arguments.contains("-demo") }
@@ -25,9 +26,12 @@ struct CameraView: View {
             } else if camera.permissionDenied {
                 PermissionNotice()
             } else {
-                CameraPreview(session: camera.session) { point in
-                    camera.focus(at: point)
-                }
+                CameraPreview(session: camera.session,
+                              onTap: { point in camera.focus(at: point) },
+                              onPinch: { scale in
+                                  camera.setZoom(pinchBase * scale)
+                              },
+                              onPinchEnded: { pinchBase = camera.zoom })
                 .ignoresSafeArea()
             }
 
@@ -101,6 +105,10 @@ struct CameraView: View {
 
     private var bottomBar: some View {
         VStack(spacing: 16) {
+            if !isDemo {
+                ZoomStrip(camera: camera, pinchBase: $pinchBase)
+            }
+
             PresetStrip(index: $presetIndex)
 
             HStack(spacing: 14) {
@@ -224,6 +232,53 @@ struct LibraryThumb: View {
                 .stroke(.white.opacity(0.45), lineWidth: 1))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// 촬영 중 확대. 메인 센서를 자르는 디지털 줌이라 렌즈가 바뀌지 않는다.
+struct ZoomStrip: View {
+    @ObservedObject var camera: Camera
+    @Binding var pinchBase: CGFloat
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(camera.zoomStops, id: \.self) { stop in
+                let selected = abs(camera.zoom - stop) < 0.06
+                Button {
+                    camera.setZoom(stop)
+                    pinchBase = stop
+                } label: {
+                    Text(label(stop))
+                        .font(.system(size: selected ? 13 : 11.5,
+                                      weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .frame(width: 42, height: 32)
+                        .background(Circle().fill(selected ? .yellow : .black.opacity(0.45))
+                            .frame(width: 36, height: 36))
+                        .foregroundStyle(selected ? .black : .white)
+                }
+                .buttonStyle(.plain)
+            }
+            if !isStop(camera.zoom) {
+                Text(String(format: "%.1f×", camera.zoom))
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.yellow))
+            }
+        }
+        .frame(height: 40)
+        .sensoryFeedback(.selection, trigger: camera.zoom)
+    }
+
+    private func isStop(_ value: CGFloat) -> Bool {
+        camera.zoomStops.contains { abs($0 - value) < 0.06 }
+    }
+
+    private func label(_ stop: CGFloat) -> String {
+        stop == stop.rounded() ? "\(Int(stop))×" : String(format: "%.1f×", stop)
     }
 }
 

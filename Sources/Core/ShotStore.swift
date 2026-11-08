@@ -64,7 +64,7 @@ final class ShotStore: ObservableObject {
 
     func save(raw: Data?, preview: Data?, depth: AVDepthData?, matte: AVPortraitEffectsMatte?,
               metadata: [String: Any], dimensions: CGSize, focusDistance: Float,
-              isProRAW: Bool) throws -> Shot {
+              captureZoom: Float = 1, isProRAW: Bool) throws -> Shot {
         var shot = Shot()
         let presets = DevelopSettings.presets
         shot.develop = presets[min(max(capturePreset, 0), presets.count - 1)].settings
@@ -72,6 +72,7 @@ final class ShotStore: ObservableObject {
         shot.pixelHeight = Int(dimensions.height)
         shot.isProRAW = isProRAW && raw != nil
         shot.focusDistance = focusDistance
+        shot.captureZoom = max(captureZoom, 1)
 
         // EXIF
         if let exif = metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] {

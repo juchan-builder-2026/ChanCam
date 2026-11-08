@@ -93,6 +93,63 @@ kernel void depth_push(texture2d<float, access::read>   fine   [[texture(0)]],
     }
 }
 
+/// 착란원 경계를 이미지 가장자리에 맞춰 다듬는다 (가이드 바이래터럴, 분리형).
+///
+/// 깊이맵은 이미지보다 훨씬 거칠어서 그대로 쓰면 능선 같은 데서 계단이 보인다.
+/// 밝기가 비슷한 쪽끼리만 섞으면 계단은 사라지고 진짜 경계는 남는다.
+inline float cocGuidedLine(texture2d<float, access::sample> coc,
+                           texture2d<float, access::sample> guide,
+                           float2 uv, float2 step, int radius)
+{
+    float centerC = coc.sample(kLinear, uv).r;
+    float centerL = luma(guide.sample(kLinear, uv).rgb);
+    float acc = centerC, wsum = 1.0f;
+    float sigma2 = 0.35f * float(radius * radius) + 1.0f;
+    for (int i = 1; i <= radius; ++i) {
+        float spatial = exp(-0.5f * float(i * i) / sigma2);
+        for (int s = -1; s <= 1; s += 2) {
+            float2 suv = uv + step * float(i * s);
+            float v = coc.sample(kLinear, suv).r;
+            float sl = luma(guide.sample(kLinear, suv).rgb);
+            float dl = (sl - centerL) / 0.16f;
+            float wgt = spatial * exp(-0.5f * dl * dl);
+            acc += v * wgt;
+            wsum += wgt;
+        }
+    }
+    return acc / max(wsum, 1e-5f);
+}
+
+kernel void coc_guided_h(texture2d<float, access::sample> coc   [[texture(0)]],
+                         texture2d<float, access::sample> guide [[texture(1)]],
+                         texture2d<float, access::write>  dst   [[texture(2)]],
+                         constant float& radius                  [[buffer(0)]],
+                         uint2 gid                               [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 size = float2(w, h);
+    float2 uv = (float2(gid) + 0.5f) / size;
+    int r = int(clamp(radius, 1.0f, 12.0f));
+    float v = cocGuidedLine(coc, guide, uv, float2(1.0f / size.x, 0.0f), r);
+    dst.write(float4(v, 0, 0, 1), gid);
+}
+
+kernel void coc_guided_v(texture2d<float, access::sample> coc   [[texture(0)]],
+                         texture2d<float, access::sample> guide [[texture(1)]],
+                         texture2d<float, access::write>  dst   [[texture(2)]],
+                         constant float& radius                  [[buffer(0)]],
+                         uint2 gid                               [[thread_position_in_grid]])
+{
+    uint w = dst.get_width(), h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float2 size = float2(w, h);
+    float2 uv = (float2(gid) + 0.5f) / size;
+    int r = int(clamp(radius, 1.0f, 12.0f));
+    float v = cocGuidedLine(coc, guide, uv, float2(0.0f, 1.0f / size.y), r);
+    dst.write(float4(v, 0, 0, 1), gid);
+}
+
 /// rg16f → r32f 깊이. 끝까지 못 메운 곳은 '아주 먼 곳'으로 둔다.
 kernel void depth_unpack(texture2d<float, access::read>  src [[texture(0)]],
                          texture2d<float, access::write> dst [[texture(1)]],

@@ -1050,7 +1050,14 @@ final class Renderer: @unchecked Sendable {
                 scale: settings.bokehScale)
             try run("coc_from_depth", command, textures: [depthFinal, cocRaw],
                     params: cocParams, size: (depthW, depthH))
+            // 깊이맵이 이미지보다 거칠어서 생기는 계단을, 이미지를 가이드로
+            // 삼아 다듬는다. 진짜 경계(피사체 윤곽)는 그대로 남는다.
             try run("coc_smooth", command, textures: [cocRaw, cocSmooth], size: (depthW, depthH))
+            let guideRadius = Float(max(3, min(depthW, depthH) / 120))
+            try run("coc_guided_h", command, textures: [cocSmooth, depthGuide, cocRaw],
+                    params: guideRadius, size: (depthW, depthH))
+            try run("coc_guided_v", command, textures: [cocRaw, depthGuide, cocSmooth],
+                    params: guideRadius, size: (depthW, depthH))
             finish(command)
 
             maxRadius = min(Renderer.maxCoCPixels(settings: settings, focus: focus,
@@ -1101,8 +1108,18 @@ final class Renderer: @unchecked Sendable {
         return true
     }
 
+    /// 구멍을 메울 수 있는 최대 반경 (깊이 작업 해상도 기준 픽셀).
+    /// 이보다 큰 구멍은 '메울 근거가 없는 곳' = LiDAR 사거리 밖 = 무한대로 둔다.
+    static let depthFillLevels = 5
+
     /// LiDAR 가 못 읽은 구멍을 push-pull 피라미드로 메운다.
     /// 유효한 값만 모아 올리고(pull), 내려오면서 구멍만 채운다(push).
+    ///
+    /// **반드시 몇 단계에서 멈춰야 한다.** 끝까지 올리면 하늘처럼 화면의 절반을
+    /// 차지하는 구멍이 '화면 전체 평균'으로 채워진다. 실내에서 창밖을 찍으면
+    /// 유효한 깊이는 손과 가구뿐이라, 하늘에 "30cm"가 들어가 버린다.
+    /// 그러면 능선에서 착란원 부호가 뒤집히며 계단 모양 하드 엣지가 생긴다.
+    /// (v1.3 에서 실제로 그랬다.)
     private func fillDepthHoles(_ source: MTLTexture) throws -> MTLTexture? {
         let w = source.width, h = source.height
         guard let base = texture(w, h, format: .rg16Float) else { return nil }
@@ -1112,10 +1129,10 @@ final class Renderer: @unchecked Sendable {
             finish(command)
         }
 
-        // 피라미드 올리기
+        // 피라미드 올리기 — 제한된 단계까지만
         var levels: [MTLTexture] = [base]
         var lw = w, lh = h
-        while lw > 8 || lh > 8 {
+        while levels.count <= Renderer.depthFillLevels, lw > 8 || lh > 8 {
             lw = max(lw / 2, 1); lh = max(lh / 2, 1)
             guard let next = texture(lw, lh, format: .rg16Float) else { break }
             let command = try newCommand()
@@ -1123,7 +1140,6 @@ final class Renderer: @unchecked Sendable {
                     size: (lw, lh))
             finish(command)
             levels.append(next)
-            if levels.count > 14 { break }
         }
 
         // 내려오면서 구멍 메우기

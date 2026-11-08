@@ -165,7 +165,8 @@ struct EditorView: View {
 
     /// 지금 실제로 쓰이는 환산 화각과 확대에 따른 해상도 손실
     private var autoFocalNote: String {
-        let captured = shot.focalLength35 > 1 ? shot.focalLength35 : 24
+        let captured = (shot.focalLength35 > 1 ? shot.focalLength35 : 24)
+            * max(shot.captureZoom, 1)
         let effective = settings.effectiveFocalLength(captured: captured)
         let base = String(format: "촬영 %.0fmm → 지금 %.0fmm 상당", captured, effective)
         guard settings.zoom > 1.01 else { return base }
@@ -391,7 +392,9 @@ struct BokehInfoRow: View {
     }
 
     private var effectiveFocal: Float {
-        settings.effectiveFocalLength(captured: shot.focalLength35 > 1 ? shot.focalLength35 : 24)
+        let captured = (shot.focalLength35 > 1 ? shot.focalLength35 : 24)
+            * max(shot.captureZoom, 1)
+        return settings.effectiveFocalLength(captured: captured)
     }
 
     private var maxBlur: Float {

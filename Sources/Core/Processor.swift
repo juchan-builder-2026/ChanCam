@@ -357,8 +357,10 @@ final class Processor: ObservableObject {
         input.auto = analyze ? (renderer?.analyze(linear) ?? .neutral) : .neutral
         input.autoNR = Processor.autoNoise(iso: shot.iso)
         input.noiseFloor = Processor.noiseFloor(iso: shot.iso)
-        // EXIF 가 알려준 실제 화각. 아이폰 광각은 24mm 다.
-        input.capturedFocal = shot.focalLength35 > 1 ? shot.focalLength35 : 24
+        // EXIF 가 알려준 실제 화각(아이폰 광각 = 24mm) × 찍을 때 쓴 확대 배율.
+        // 센서를 잘라 찍었으면 그만큼 망원으로 찍은 것과 같다.
+        let base = shot.focalLength35 > 1 ? shot.focalLength35 : 24
+        input.capturedFocal = base * max(shot.captureZoom, 1)
         publish("analyze", 1)
         return input
     }

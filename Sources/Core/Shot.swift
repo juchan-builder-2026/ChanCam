@@ -23,6 +23,8 @@ struct Shot: Codable, Identifiable, Equatable {
     var deviceAperture: Float = 0
     var focalLength35: Float = 0
     var focusDistance: Float = 0 // m, LiDAR 기준 초점면
+    /// 찍을 때 쓴 디지털 확대 배율. 환산 화각 계산에 그대로 곱한다.
+    var captureZoom: Float = 1
     var lensName = ""
     var isProRAW = false
     var hasDepth: Bool { depthFile != nil }
@@ -32,6 +34,53 @@ struct Shot: Codable, Identifiable, Equatable {
     var isFavorite = false
     /// 마지막 현상 완료 시각 (설정이 바뀌면 nil 로)
     var exportedAt: Date?
+
+    init() {}
+
+    /// 관대한 디코딩 — 새 필드가 생겨도 예전 shots.json 이 통째로 깨지지 않게.
+    /// (기본 디코더는 키가 하나만 없어도 실패해서 보관함이 빈 채로 뜬다.)
+    init(from decoder: Decoder) throws {
+        self.init()
+        guard let c = try? decoder.container(keyedBy: CodingKeys.self) else { return }
+        func s(_ k: CodingKeys, _ d: String) -> String {
+            ((try? c.decodeIfPresent(String.self, forKey: k)) ?? nil) ?? d
+        }
+        func f(_ k: CodingKeys, _ d: Float) -> Float {
+            ((try? c.decodeIfPresent(Float.self, forKey: k)) ?? nil) ?? d
+        }
+        func i(_ k: CodingKeys, _ d: Int) -> Int {
+            ((try? c.decodeIfPresent(Int.self, forKey: k)) ?? nil) ?? d
+        }
+        func b(_ k: CodingKeys, _ d: Bool) -> Bool {
+            ((try? c.decodeIfPresent(Bool.self, forKey: k)) ?? nil) ?? d
+        }
+
+        if let value = try? c.decodeIfPresent(UUID.self, forKey: .id), let value { id = value }
+        if let value = try? c.decodeIfPresent(Date.self, forKey: .date), let value { date = value }
+        rawFile = s(.rawFile, rawFile)
+        depthFile = (try? c.decodeIfPresent(String.self, forKey: .depthFile)) ?? nil
+        matteFile = (try? c.decodeIfPresent(String.self, forKey: .matteFile)) ?? nil
+        previewFile = s(.previewFile, previewFile)
+        exportFile = (try? c.decodeIfPresent(String.self, forKey: .exportFile)) ?? nil
+
+        pixelWidth = i(.pixelWidth, pixelWidth)
+        pixelHeight = i(.pixelHeight, pixelHeight)
+        depthWidth = i(.depthWidth, depthWidth)
+        depthHeight = i(.depthHeight, depthHeight)
+        iso = f(.iso, iso)
+        shutter = f(.shutter, shutter)
+        deviceAperture = f(.deviceAperture, deviceAperture)
+        focalLength35 = f(.focalLength35, focalLength35)
+        focusDistance = f(.focusDistance, focusDistance)
+        captureZoom = f(.captureZoom, captureZoom)
+        lensName = s(.lensName, lensName)
+        isProRAW = b(.isProRAW, isProRAW)
+        isFavorite = b(.isFavorite, isFavorite)
+        exportedAt = (try? c.decodeIfPresent(Date.self, forKey: .exportedAt)) ?? nil
+        if let value = try? c.decodeIfPresent(DevelopSettings.self, forKey: .develop), let value {
+            develop = value
+        }
+    }
 
     var folderName: String { id.uuidString }
 

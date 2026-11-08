@@ -33,14 +33,21 @@ struct SettingsView: View {
                         LabeledContent("측정된 GPU 처리량",
                                        value: String(format: "%.1f G탭/초", processor.gpuScore / 1e9))
                     }
+                    Toggle("메인 렌즈에서 벗어나지 않기", isOn: $camera.stayOnMainLens)
                     LabeledContent("활성 카메라", value: camera.capabilities.deviceName)
+                    LabeledContent("확대 가능 범위",
+                                   value: String(format: "1.0× – %.1f×", camera.maxZoom))
+                    if camera.lensSwitchZoom > 1 {
+                        LabeledContent("렌즈 전환 지점",
+                                       value: String(format: "%.1f×", camera.lensSwitchZoom))
+                    }
                     LabeledContent("깊이 스트림",
                                    value: camera.capabilities.streamingDepth ? "사용 중" : "사용 안 함")
                     LabeledContent("깊이 프레임", value: "\(camera.depthFrames)")
                 } header: {
                     Text("하드웨어")
                 } footer: {
-                    Text("센서 테스터는 이 기기의 카메라·GPU·신경망 능력을 하드웨어에 직접 물어봐서 보여줘요. LiDAR 깊이가 실제로 흐르고 있는지도 거기서 확인할 수 있어요.")
+                    Text("촬영 화면에서 핀치하거나 아래 배율 버튼으로 확대할 수 있어요. 메인 센서를 자르는 디지털 줌이라 LiDAR 와 어긋나지 않고, 자른 만큼 환산 화각이 올라가서 보케 계산도 같이 맞아요.\n\n'메인 렌즈에서 벗어나지 않기'를 켜두면 iOS 가 망원으로 넘어가는 지점 직전에서 멈춰요. 망원이 고장난 기기에서 이걸 끄면 확대하다가 화면이 멈출 수 있어요.")
                 }
 
                 Section {

@@ -93,6 +93,12 @@ final class Camera: NSObject, ObservableObject {
     @Published private(set) var permissionDenied = false
     @Published private(set) var liveFocusDistance: Float = 0
     @Published private(set) var capabilities = CameraCapabilities()
+    /// 촬영 중 디지털 확대 배율 (메인 센서 크롭). 1.0 = 확대 없음
+    @Published private(set) var zoom: CGFloat = 1
+    @Published private(set) var maxZoom: CGFloat = 1
+    /// 렌즈가 바뀌는 지점. 망원이 고장난 기기에서는 여기를 넘지 않게 막는다.
+    @Published private(set) var lensSwitchZoom: CGFloat = 0
+    @AppStorage("stayOnMainLens") var stayOnMainLens = true
     @Published private(set) var depthFPS: Double = 0
     @Published private(set) var depthCoverage: Double = 0
     @Published private(set) var depthFrames = 0
@@ -124,6 +130,7 @@ final class Camera: NSObject, ObservableObject {
         var metadata: [String: Any] = [:]
         var dimensions = CGSize.zero
         var focusDistance: Float = 0
+        var zoom: Float = 1
     }
 
     // MARK: - 설정
@@ -293,11 +300,23 @@ final class Camera: NSObject, ObservableObject {
             caps.depthHeight = Int(d.height)
         }
 
+        // 확대 가능 범위 — 망원이 고장난 기기를 위해 렌즈 전환 지점 앞에서 멈춘다
+        let switchPoints = device.virtualDeviceSwitchOverVideoZoomFactors
+            .map { CGFloat(truncating: $0) }
+            .filter { $0 > 1 }
+        var ceiling = min(device.activeFormat.videoMaxZoomFactor, 12)
+        let stayMain = UserDefaults.standard.object(forKey: "stayOnMainLens") as? Bool ?? true
+        if stayMain, let first = switchPoints.min() { ceiling = min(ceiling, first - 0.01) }
+        let currentZoom = device.videoZoomFactor
+
         Task { @MainActor in
             self.isReady = true
             self.modeLabel = String(format: "%.0fMP %@", mp.rounded(.down), raw)
             self.detailLabel = "\(dims.width)×\(dims.height)\(depthText)\(matteText)"
             self.capabilities = caps
+            self.maxZoom = max(ceiling, 1)
+            self.lensSwitchZoom = switchPoints.min() ?? 0
+            self.zoom = currentZoom
         }
     }
 
@@ -341,6 +360,47 @@ final class Camera: NSObject, ObservableObject {
         }
     }
 
+    /// 메인 센서를 잘라 확대한다 (디지털 줌).
+    ///
+    /// 멀티 카메라 장치에서는 배율이 일정 지점을 넘으면 iOS 가 망원으로 넘어가는데,
+    /// 망원이 고장난 기기에서는 그게 재앙이다. `stayOnMainLens` 가 켜져 있으면
+    /// 그 지점 직전까지만 올라간다.
+    func setZoom(_ factor: CGFloat) {
+        let requested = max(factor, 1)
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.device else { return }
+            var ceiling = min(device.activeFormat.videoMaxZoomFactor, 12)
+            let switchPoints = device.virtualDeviceSwitchOverVideoZoomFactors
+                .map { CGFloat(truncating: $0) }
+                .filter { $0 > 1 }
+            if self.stayOnMainLens, let first = switchPoints.min() {
+                ceiling = min(ceiling, first - 0.01)
+            }
+            let clamped = min(max(requested, 1), max(ceiling, 1))
+            do {
+                try device.lockForConfiguration()
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+            } catch {
+                return
+            }
+            Task { @MainActor in
+                self.zoom = clamped
+                self.maxZoom = max(ceiling, 1)
+                self.lensSwitchZoom = switchPoints.min() ?? 0
+            }
+        }
+    }
+
+    /// 확대 단계 버튼에 쓸 값들 — 기기가 실제로 낼 수 있는 범위 안에서만
+    var zoomStops: [CGFloat] {
+        let candidates: [CGFloat] = [1, 1.5, 2, 3, 5, 8]
+        let limit = maxZoom > 1 ? maxZoom : 2
+        var stops = candidates.filter { $0 <= limit + 0.001 }
+        if stops.isEmpty { stops = [1] }
+        return stops
+    }
+
     func setExposureBias(_ ev: Float) {
         sessionQueue.async { [weak self] in
             guard let device = self?.device else { return }
@@ -380,6 +440,7 @@ final class Camera: NSObject, ObservableObject {
             // 셔터 순간의 마지막 LiDAR 프레임을 붙인다
             bundle.depth = self.depthBox.latest
             bundle.focusDistance = self.depthBox.latestDistance
+            bundle.zoom = Float(self.device?.videoZoomFactor ?? 1)
             self.pendingCaptures[settings.uniqueID] = bundle
             self.output.capturePhoto(with: settings, delegate: self)
         }
@@ -450,6 +511,7 @@ extension Camera: AVCapturePhotoCaptureDelegate {
                     metadata: bundle.metadata,
                     dimensions: bundle.dimensions,
                     focusDistance: bundle.focusDistance,
+                    captureZoom: bundle.zoom,
                     isProRAW: output.isAppleProRAWEnabled)
                 self.onShot?(shot)
             } catch {
@@ -528,21 +590,29 @@ extension Camera: AVCaptureDepthDataOutputDelegate {
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     var onTap: ((CGPoint) -> Void)?
+    var onPinch: ((CGFloat) -> Void)?
+    var onPinchEnded: (() -> Void)?
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspectFill
         view.onTap = onTap
+        view.onPinch = onPinch
+        view.onPinchEnded = onPinchEnded
         return view
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
         uiView.onTap = onTap
+        uiView.onPinch = onPinch
+        uiView.onPinchEnded = onPinchEnded
     }
 
     final class PreviewView: UIView {
         var onTap: ((CGPoint) -> Void)?
+        var onPinch: ((CGFloat) -> Void)?
+        var onPinchEnded: (() -> Void)?
 
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
@@ -551,6 +621,8 @@ struct CameraPreview: UIViewRepresentable {
             super.init(frame: frame)
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             addGestureRecognizer(tap)
+            let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+            addGestureRecognizer(pinch)
         }
 
         required init?(coder: NSCoder) { fatalError() }
@@ -559,6 +631,17 @@ struct CameraPreview: UIViewRepresentable {
             let point = gesture.location(in: self)
             let device = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             onTap?(device)
+        }
+
+        @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+            switch gesture.state {
+            case .changed:
+                onPinch?(gesture.scale)
+            case .ended, .cancelled, .failed:
+                onPinchEnded?()
+            default:
+                break
+            }
         }
     }
 }
